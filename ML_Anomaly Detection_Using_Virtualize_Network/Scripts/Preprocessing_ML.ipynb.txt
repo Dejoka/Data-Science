@@ -1,0 +1,2868 @@
+import os
+import glob
+import warnings
+import time
+warnings.filterwarnings('ignore')
+
+
+# In[2]
+
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+
+# In[3]:
+
+
+# Scikit-learn imports for preprocessing and modeling
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, chi2, f_classif
+
+# Scikit-learn imports for metrics
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score, 
+                            roc_curve, auc, matthews_corrcoef, accuracy_score, 
+                            precision_score, recall_score, f1_score)
+
+
+# In[4]:
+
+
+# Scikit-learn imports for models
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+# Imbalanced-learn for SMOTE
+from imblearn.over_sampling import SMOTE
+
+
+# In[5]:
+
+
+# Utilities
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# In[6]:
+
+
+DATA_DIR = r"C:\Users\Dell\Documents\GeneratedLabelledFlows\TrafficLabelling"
+
+files = glob.glob(os.path.join(DATA_DIR, "*.csv"))  # reads all .csv files
+
+all_dataframes = []
+
+for file in files:
+    print("Loading:", file)
+    try:
+        # Try UTF-8 first
+        df = pd.read_csv(file)
+    except UnicodeDecodeError:
+        # Fall back to common encodings
+        try:
+            df = pd.read_csv(file, encoding='latin-1')
+            print(f"  → Loaded with latin-1 encoding")
+        except:
+            try:
+                df = pd.read_csv(file, encoding='windows-1252')
+                print(f"  → Loaded with windows-1252 encoding")
+            except Exception as e:
+                print(f"  → Failed to load: {e}")
+                continue
+    
+    all_dataframes.append(df)
+
+
+# In[7]:
+
+
+# Check if all files have the same columns
+print("Checking column consistency...\n")
+
+first_cols = set(all_dataframes[0].columns)
+all_same = True
+
+for i, df in enumerate(all_dataframes):
+    current_cols = set(df.columns)
+    if current_cols != first_cols:
+        all_same = False
+        print(f"File {i+1} ({files[i]}):")
+        print(f"  Columns: {len(df.columns)}")
+        
+        missing = first_cols - current_cols
+        extra = current_cols - first_cols
+        
+        if missing:
+            print(f"  Missing: {missing}")
+        if extra:
+            print(f"  Extra: {extra}")
+        print()
+
+if all_same:
+    print("✓ All files have identical columns - you're good!")
+else:
+    print("⚠ Files have different columns - need to handle this")
+
+
+# In[8]:
+
+
+# Combine them into one dataset
+if all_dataframes:  # Check if list is not empty
+    data = pd.concat(all_dataframes, ignore_index=True)
+    print("Files loaded:", len(files))
+    print("Total rows:", data.shape[0])
+    print("Columns:", len(data.columns))
+else:
+    print("No dataframes were loaded successfully!")
+
+
+# In[9]:
+
+
+# Configuration
+CHUNK_SIZE = 50000  # Chunk size (rows per chunk) - adjust between 10,000-20,000 based on your RAM
+RANDOM_STATE = 42  # Random state for reproducibility
+BINARY_CLASSIFICATION = True  # Binary or multi-class classification
+OUTPUT_DIR = './models_output'  # Output directory for processed data
+
+# Create output directory
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("="*80)
+print("CICIDS2017 CHUNK-BASED DATA LOADING")
+print("="*80)
+print(f"Configuration:")
+print(f"  - Total Files Loaded: {len(files)}")
+print(f"  - Total Rows: {data.shape[0]:,}")
+print(f"  - Total Columns: {data.shape[1]}")
+print(f"  - Chunk Size: {CHUNK_SIZE:,} rows")
+print(f"  - Number of Chunks: {int(np.ceil(data.shape[0] / CHUNK_SIZE))}")
+print(f"  - Classification Mode: {'Binary' if BINARY_CLASSIFICATION else 'Multi-class'}")
+print(f"  - Random State: {RANDOM_STATE}")
+print(f"  - Output Directory: {OUTPUT_DIR}")
+print("="*80)
+
+# Optional: Shuffle the data before chunking
+data = data.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+print("✓ Data shuffled for better distribution across chunks")
+print("="*80)
+
+
+# In[11]:
+
+
+print("\nSTEP 1: CSV Files Already Loaded")
+print(f"Total files loaded: {len(files)}")
+print(f"Files processed:")
+for idx, file in enumerate(files, 1):
+    try:
+        file_size_mb = os.path.getsize(file) / (1024 * 1024)
+        print(f"  {idx}. {os.path.basename(file)} ({file_size_mb:.2f} MB)")
+    except:
+        print(f"  {idx}. {os.path.basename(file)}")
+
+print(f"\n✓ Combined dataset: {data.shape[0]:,} rows × {data.shape[1]} columns")
+memory_usage_mb = data.memory_usage(deep=True).sum() / (1024**2)
+print(f"✓ Memory usage: {memory_usage_mb:.2f} MB")
+
+
+# In[12]:
+
+
+print("\n" + "="*80)
+print("STEP 2: Analyzing class distribution")
+print("="*80)
+
+# Strip whitespace from column names
+data.columns = data.columns.str.strip()
+
+# Find the label column
+label_col = None
+if 'Label' in data.columns:
+    label_col = 'Label'
+elif ' Label' in data.columns:
+    label_col = ' Label'
+else:
+    print("Available columns:", list(data.columns))
+    raise ValueError("No 'Label' column found in the dataset")
+
+print(f"Label column found: '{label_col}'")
+
+# Count label distribution
+label_counts = data[label_col].value_counts()
+total_samples = len(data)
+
+print("\n" + "-"*80)
+print("OVERALL CLASS DISTRIBUTION:")
+print("-"*80)
+
+for label, count in label_counts.items():
+    percentage = (count / total_samples) * 100
+    print(f"  {label}: {count:,} samples ({percentage:.2f}%)")
+
+print(f"\nTotal samples: {total_samples:,}")
+print(f"Number of classes: {len(label_counts)}")
+
+# Check for class imbalance
+max_class = label_counts.max()
+min_class = label_counts.min()
+imbalance_ratio = max_class / min_class
+
+print(f"\nClass imbalance ratio: {imbalance_ratio:.2f}:1")
+if imbalance_ratio > 10:
+    print("⚠️  Significant class imbalance detected - consider using:")
+    print("   - SMOTE (oversampling)")
+    print("   - Class weights")
+    print("   - Stratified sampling")
+
+print("="*80)
+
+
+# In[13]:
+
+
+# =================================================================================
+# STEP 3: CLASS DISTRIBUTION ANALYSIS
+# =================================================================================
+print("\n" + "="*80)
+print("STEP 3: Analyzing Class Distribution")
+print("="*80)
+
+# Find label column
+label_col = 'Label' if 'Label' in data.columns else ' Label'
+print(f"Label column: '{label_col}'")
+
+# Show original distribution
+print("\nOriginal Class Distribution:")
+print("-"*80)
+label_counts = data[label_col].value_counts()
+for label, count in label_counts.items():
+    percentage = (count / len(data)) * 100
+    print(f"  {label:30s}: {count:>10,} samples ({percentage:>5.2f}%)")
+
+print(f"\nTotal samples: {len(data):,}")
+print(f"Number of classes: {len(label_counts)}")
+
+# Check imbalance
+max_class = label_counts.max()
+min_class = label_counts.min()
+imbalance_ratio = max_class / min_class
+print(f"Imbalance ratio: {imbalance_ratio:.2f}:1")
+
+
+# =================================================================================
+# STEP 4: REMOVE RARE CLASSES
+# =================================================================================
+print("\n" + "="*80)
+print("STEP 4: Removing Rare Classes")
+print("="*80)
+
+MIN_SAMPLES_THRESHOLD = 1000
+print(f"Removing classes with < {MIN_SAMPLES_THRESHOLD:,} samples:")
+
+rare_classes = []
+for label, count in label_counts.items():
+    if count < MIN_SAMPLES_THRESHOLD:
+        print(f"  ✗ Removing: {label:30s} ({count:,} samples)")
+        rare_classes.append(label)
+        data = data[data[label_col] != label]
+    else:
+        print(f"  ✓ Keeping: {label:30s} ({count:,} samples)")
+
+# Recalculate after removal
+label_counts = data[label_col].value_counts()
+print(f"\n✓ Remaining classes: {len(label_counts)}")
+print(f"✓ Total samples: {len(data):,}")
+
+
+# =================================================================================
+# STEP 5: BINARY LABEL ENCODING
+# =================================================================================
+print("\n" + "="*80)
+print("STEP 5: Binary Label Encoding")
+print("="*80)
+
+if BINARY_CLASSIFICATION:
+    # Create binary labels: BENIGN = 0, ALL ATTACKS = 1
+    print("Creating binary labels:")
+    print("  - BENIGN → 0 (Negative class)")
+    print("  - ALL ATTACKS → 1 (Positive class)")
+    
+    data['target'] = data[label_col].apply(
+        lambda x: 0 if str(x).upper().strip() == 'BENIGN' else 1
+    )
+    
+    # Show distribution
+    benign_count = (data['target'] == 0).sum()
+    attack_count = (data['target'] == 1).sum()
+    
+    print(f"\nBinary class distribution:")
+    print(f"  Class 0 (BENIGN): {benign_count:,} samples ({benign_count/len(data)*100:.2f}%)")
+    print(f"  Class 1 (ATTACK): {attack_count:,} samples ({attack_count/len(data)*100:.2f}%)")
+    
+    # Drop original label column
+    data = data.drop(columns=[label_col])
+    
+else:
+    # Multi-class encoding
+    from sklearn.preprocessing import LabelEncoder
+    import joblib
+    
+    print("Creating multi-class labels...")
+    le = LabelEncoder()
+    data['target'] = le.fit_transform(data[label_col].astype(str))
+    
+    # Save label encoder
+    le_path = os.path.join(OUTPUT_DIR, 'label_encoder.joblib')
+    joblib.dump(le, le_path)
+    print(f"✓ Label encoder saved to: {le_path}")
+    
+    # Show mapping
+    print("\nClass mapping:")
+    for idx, class_name in enumerate(le.classes_):
+        count = (data['target'] == idx).sum()
+        print(f"  Class {idx} ({class_name}): {count:,} samples")
+    
+    # Drop original label column
+    data = data.drop(columns=[label_col])
+
+
+# =================================================================================
+# STEP 6: BALANCED SAMPLING STRATEGY
+# =================================================================================
+print("\n" + "="*80)
+print("STEP 6: Balanced Sampling Strategy")
+print("="*80)
+
+if BINARY_CLASSIFICATION:
+    # For binary classification, we want a realistic imbalance
+    # Not 50-50, but maybe 60-40 or 70-30 (more realistic for IDS)
+    
+    attack_count = (data['target'] == 1).sum()
+    benign_count = (data['target'] == 0).sum()
+    
+    # Strategy: 70% benign, 30% attack (realistic for IDS)
+    target_benign = min(int(attack_count * 2.33), benign_count, 100000)  # Cap at 100k
+    target_attack = min(attack_count, 50000)  # Cap attacks at 50k
+    
+    print(f"Sampling strategy for binary classification:")
+    print(f"  Original BENIGN: {benign_count:,}")
+    print(f"  Original ATTACK: {attack_count:,}")
+    print(f"  Target BENIGN: {target_benign:,}")
+    print(f"  Target ATTACK: {target_attack:,}")
+    print(f"  Ratio: {target_benign/(target_benign+target_attack)*100:.1f}% BENIGN, {target_attack/(target_benign+target_attack)*100:.1f}% ATTACK")
+    
+    # Sample benign class
+    benign_data = data[data['target'] == 0]
+    if len(benign_data) > target_benign:
+        benign_sampled = benign_data.sample(n=target_benign, random_state=RANDOM_STATE)
+    else:
+        benign_sampled = benign_data
+    
+    # Sample attack class
+    attack_data = data[data['target'] == 1]
+    if len(attack_data) > target_attack:
+        attack_sampled = attack_data.sample(n=target_attack, random_state=RANDOM_STATE)
+    else:
+        attack_sampled = attack_data
+    
+    # Combine
+    balanced_data = pd.concat([benign_sampled, attack_sampled], ignore_index=True)
+    
+else:
+    # Multi-class: use equal sampling per class
+    target_per_class = min(label_counts.min(), 50000)
+    balanced_samples = []
+    
+    print(f"Target per class: {target_per_class:,} samples")
+    
+    for class_val in data['target'].unique():
+        class_data = data[data['target'] == class_val]
+        if len(class_data) > target_per_class:
+            sampled = class_data.sample(n=target_per_class, random_state=RANDOM_STATE)
+        else:
+            sampled = class_data
+        balanced_samples.append(sampled)
+    
+    balanced_data = pd.concat(balanced_samples, ignore_index=True)
+
+# Shuffle
+balanced_data = balanced_data.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+
+print(f"\n✓ Balanced dataset created: {len(balanced_data):,} samples")
+print(f"✓ Memory usage: {balanced_data.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
+
+# Show final distribution
+print("\nFinal class distribution:")
+final_counts = balanced_data['target'].value_counts().sort_index()
+for class_val, count in final_counts.items():
+    percentage = (count / len(balanced_data)) * 100
+    if BINARY_CLASSIFICATION:
+        class_name = "BENIGN" if class_val == 0 else "ATTACK"
+    else:
+        class_name = le.inverse_transform([class_val])[0]
+    print(f"  Class {class_val} ({class_name}): {count:,} samples ({percentage:.2f}%)")
+
+# Update data variable and free memory
+data = balanced_data.copy()
+del balanced_data
+import gc
+gc.collect()
+
+print("="*80)
+
+
+# In[14]:
+
+
+data.head()
+
+
+# In[18]:
+
+
+print("\n" + "="*80)
+print("STEP 2: Data Cleaning")
+print("="*80)
+
+# Strip whitespace from column names
+data.columns = data.columns.str.strip()
+print(f"✓ Cleaned column names")
+
+# Check initial state
+initial_rows = len(data)
+initial_cols = len(data.columns)
+print(f"Initial shape: {data.shape}")
+
+# Remove duplicates
+data = data.drop_duplicates()
+duplicates_removed = initial_rows - len(data)
+print(f"✓ Removed {duplicates_removed:,} duplicate rows ({duplicates_removed/initial_rows*100:.2f}%)")
+
+# Replace infinity values
+inf_count = np.isinf(data.select_dtypes(include=[np.number])).sum().sum()
+data = data.replace([np.inf, -np.inf], np.nan)
+print(f"✓ Replaced {inf_count:,} infinity values with NaN")
+
+# Remove columns with all NaN
+all_nan_cols = data.columns[data.isna().all()].tolist()
+if all_nan_cols:
+    data = data.drop(columns=all_nan_cols)
+    print(f"✓ Removed {len(all_nan_cols)} columns with all NaN: {all_nan_cols}")
+else:
+    print(f"✓ No columns with all NaN values")
+
+# Remove non-predictive columns (IPs, timestamps, ports, IDs)
+drop_cols = []
+for col in data.columns:
+    col_lower = col.lower()
+    if any(keyword in col_lower for keyword in ['timestamp', 'ip', 'port', 'flow id', 'source', 'destination']):
+        if col not in ['Label', ' Label', 'target']:  # Preserve label columns
+            drop_cols.append(col)
+
+if drop_cols:
+    print(f"✓ Dropping {len(drop_cols)} non-predictive columns:")
+    for col in drop_cols:
+        print(f"    - {col}")
+    data = data.drop(columns=drop_cols)
+else:
+    print(f"✓ No non-predictive columns found to remove")
+
+# Final summary
+final_rows = len(data)
+final_cols = len(data.columns)
+print(f"\n{'='*40}")
+print(f"Cleaning Summary:")
+print(f"  Rows: {initial_rows:,} → {final_rows:,} ({final_rows/initial_rows*100:.1f}% retained)")
+print(f"  Columns: {initial_cols} → {final_cols}")
+print(f"  Memory: {data.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
+print(f"{'='*40}")
+
+# Memory cleanup
+import gc
+gc.collect()
+
+print("="*80)
+
+
+# In[19]:
+
+
+data.head()
+
+
+# In[20]:
+
+
+print("\n" + "="*80)
+print("STEP 2: Data Cleaning")
+print("="*80)
+
+# Strip whitespace from column names
+data.columns = data.columns.str.strip()
+print(f"✓ Cleaned column names")
+
+# Initial state
+initial_rows = len(data)
+initial_cols = len(data.columns)
+print(f"Initial shape: {data.shape}")
+
+# Remove duplicates
+data = data.drop_duplicates()
+duplicates_removed = initial_rows - len(data)
+print(f"✓ Removed {duplicates_removed:,} duplicate rows")
+
+# Replace infinity values
+data = data.replace([np.inf, -np.inf], np.nan)
+print(f"✓ Replaced infinity values with NaN")
+
+# Remove columns with all NaN
+all_nan_cols = data.columns[data.isna().all()].tolist()
+if all_nan_cols:
+    data = data.drop(columns=all_nan_cols)
+    print(f"✓ Removed {len(all_nan_cols)} columns with all NaN")
+
+# Remove non-predictive columns
+drop_cols = []
+for col in data.columns:
+    col_lower = col.lower()
+    if any(keyword in col_lower for keyword in ['timestamp', 'ip', 'port', 'flow id', 'source', 'destination']):
+        if col not in ['Label', ' Label', 'target']:
+            drop_cols.append(col)
+
+if drop_cols:
+    print(f"✓ Dropping {len(drop_cols)} non-predictive columns")
+    data = data.drop(columns=drop_cols)
+
+# HANDLE NaN VALUES (NEW)
+print("\nHandling NaN values...")
+# Drop columns with >50% NaN
+threshold = len(data) * 0.5
+nan_counts = data.isna().sum()
+high_nan_cols = nan_counts[nan_counts > threshold].index.tolist()
+if high_nan_cols:
+    print(f"✓ Dropping {len(high_nan_cols)} columns with >50% NaN")
+    data = data.drop(columns=high_nan_cols)
+
+# Drop rows with remaining NaN
+rows_before = len(data)
+data = data.dropna()
+rows_dropped = rows_before - len(data)
+print(f"✓ Dropped {rows_dropped:,} rows with NaN ({rows_dropped/rows_before*100:.2f}%)")
+
+# Final summary
+print(f"\n{'='*40}")
+print(f"Cleaning Summary:")
+print(f"  Rows: {initial_rows:,} → {len(data):,}")
+print(f"  Columns: {initial_cols} → {len(data.columns)}")
+print(f"  Remaining NaN: {data.isna().sum().sum()}")
+print(f"  Memory: {data.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
+print(f"{'='*40}")
+
+gc.collect()
+print("="*80)
+
+
+# In[21]:
+
+
+data.head()
+
+
+# In[22]:
+
+
+# =================================================================================
+# STEP 7: PREPROCESSING - HANDLE MISSING VALUES & CATEGORICAL FEATURES
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 7: Data Preprocessing (Section 3.5)")
+print("="*80)
+
+# Get numeric columns (excluding target)
+numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+numeric_cols = [c for c in numeric_cols if c != 'target']
+
+print(f"Numeric features: {len(numeric_cols)}")
+
+# Check for missing values
+missing_counts = data[numeric_cols].isna().sum()
+total_missing = missing_counts.sum()
+
+if total_missing > 0:
+    print(f"\nImputing {total_missing:,} missing values using median strategy")
+    
+    # Impute missing values (Section 3.5.2)
+    imputer = SimpleImputer(strategy='median')
+    data[numeric_cols] = imputer.fit_transform(data[numeric_cols])
+    
+    # Save imputer
+    imputer_path = os.path.join(OUTPUT_DIR, 'imputer.joblib')
+    joblib.dump(imputer, imputer_path)
+    print(f"✓ Imputer saved to: {imputer_path}")
+else:
+    print("✓ No missing values found")
+
+# Remove zero-variance features
+print("\nChecking for zero-variance features...")
+nunique = data[numeric_cols].nunique()
+zero_var_cols = nunique[nunique <= 1].index.tolist()
+
+if zero_var_cols:
+    print(f"Removing {len(zero_var_cols)} zero-variance features:")
+    for col in zero_var_cols[:10]:  # Show first 10
+        print(f"  - {col}")
+    data = data.drop(columns=zero_var_cols)
+    numeric_cols = [c for c in numeric_cols if c not in zero_var_cols]
+else:
+    print("✓ No zero-variance features found")
+
+print(f"\nFeatures after preprocessing: {len(numeric_cols)}")
+
+FIGURES_DIR = "figures"
+
+# Create directory if it doesn't exist
+os.makedirs(FIGURES_DIR, exist_ok=True)
+
+print("✓ FIGURES_DIR created and ready:", FIGURES_DIR)
+
+
+# =================================================================================
+# STEP 8: FEATURE ENGINEERING (Section 3.6.1)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 8: Feature Engineering (Section 3.6.1)")
+print("="*80)
+
+initial_features = len(numeric_cols)
+print(f"Initial features: {initial_features}")
+
+# Create derived features
+def engineer_features(df):
+    """Create derived features as per methodology"""
+    df = df.copy()
+    
+    # Packet-based features
+    if 'Total Fwd Packets' in df.columns and 'Total Length of Fwd Packets' in df.columns:
+        df['fwd_bytes_per_packet'] = df['Total Length of Fwd Packets'] / (df['Total Fwd Packets'] + 1e-9)
+        print("  ✓ Created: fwd_bytes_per_packet")
+    
+    if 'Total Backward Packets' in df.columns and 'Total Length of Bwd Packets' in df.columns:
+        df['bwd_bytes_per_packet'] = df['Total Length of Bwd Packets'] / (df['Total Backward Packets'] + 1e-9)
+        print("  ✓ Created: bwd_bytes_per_packet")
+    
+    # Ratio features
+    if 'Total Length of Fwd Packets' in df.columns and 'Total Length of Bwd Packets' in df.columns:
+        df['bytes_fwd_bwd_ratio'] = (df['Total Length of Fwd Packets'] + 1e-9) / (df['Total Length of Bwd Packets'] + 1e-9)
+        print("  ✓ Created: bytes_fwd_bwd_ratio")
+    
+    if 'Total Fwd Packets' in df.columns and 'Total Backward Packets' in df.columns:
+        df['packet_fwd_bwd_ratio'] = (df['Total Fwd Packets'] + 1e-9) / (df['Total Backward Packets'] + 1e-9)
+        df['packet_balance'] = df['Total Fwd Packets'] - df['Total Backward Packets']
+        print("  ✓ Created: packet_fwd_bwd_ratio, packet_balance")
+    
+    # Flow rate features
+    if 'Flow Duration' in df.columns:
+        if 'Total Fwd Packets' in df.columns:
+            total_packets = df['Total Fwd Packets'] + df.get('Total Backward Packets', 0)
+            df['packets_per_second'] = total_packets / (df['Flow Duration'] + 1e-9)
+            print("  ✓ Created: packets_per_second")
+        
+        if 'Total Length of Fwd Packets' in df.columns:
+            total_bytes = df['Total Length of Fwd Packets'] + df.get('Total Length of Bwd Packets', 0)
+            df['bytes_per_second'] = total_bytes / (df['Flow Duration'] + 1e-9)
+            print("  ✓ Created: bytes_per_second")
+    
+    # Symmetry features
+    if 'Fwd Packet Length Mean' in df.columns and 'Bwd Packet Length Mean' in df.columns:
+        df['packet_length_mean_ratio'] = (df['Fwd Packet Length Mean'] + 1e-9) / (df['Bwd Packet Length Mean'] + 1e-9)
+        print("  ✓ Created: packet_length_mean_ratio")
+    
+    return df
+
+# Apply feature engineering
+data = engineer_features(data)
+
+# Update feature list
+feature_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+feature_cols = [c for c in feature_cols if c != 'target']
+
+print(f"\nFeature engineering complete:")
+print(f"  Initial features: {initial_features}")
+print(f"  New features created: {len(feature_cols) - initial_features}")
+print(f"  Total features: {len(feature_cols)}")
+
+# =================================================================================
+# STEP 9: CORRELATION-BASED FEATURE SELECTION (Section 3.6.2, Equation 3.6)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 9: Correlation-Based Feature Selection (Equation 3.6)")
+print("="*80)
+
+def remove_correlated_features(df, features, threshold=0.95):
+    """Remove features with correlation > threshold"""
+    print(f"Removing features with |correlation| > {threshold}")
+    
+    X = df[features]
+    corr_matrix = X.corr().abs()
+    
+    # Upper triangle
+    upper = corr_matrix.where(
+        np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+    )
+    
+    # Find features to drop
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+    
+    if len(to_drop) > 0:
+        print(f"Removing {len(to_drop)} highly correlated features")
+        if len(to_drop) <= 10:
+            for feat in to_drop:
+                print(f"  - {feat}")
+    
+    remaining = [f for f in features if f not in to_drop]
+    print(f"Features remaining: {len(remaining)}")
+    
+    return remaining
+
+# Apply correlation removal
+feature_cols = remove_correlated_features(data, feature_cols, threshold=0.95)
+
+# =================================================================================
+# STEP 10: TRAIN/VALIDATION/TEST SPLIT (Section 3.5.6, Equation 3.5)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 10: Train/Validation/Test Split (Equation 3.5)")
+print("="*80)
+
+# Extract features and target
+X = data[feature_cols].fillna(0).values
+y = data['target'].values
+
+print(f"Feature matrix: {X.shape}")
+print(f"Target vector: {y.shape}")
+
+# Class distribution
+print(f"\nClass distribution:")
+for class_idx in np.unique(y):
+    count = np.sum(y == class_idx)
+    label = "BENIGN" if class_idx == 0 else "ATTACK"
+    print(f"  Class {class_idx} ({label}): {count:,} ({count/len(y)*100:.2f}%)")
+
+# 70/15/15 split as per methodology (Equation 3.5)
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.30, stratify=y, random_state=RANDOM_STATE
+)
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=RANDOM_STATE
+)
+
+print(f"\nDataset split:")
+print(f"  Training:   {X_train.shape[0]:,} ({X_train.shape[0]/len(X)*100:.1f}%)")
+print(f"  Validation: {X_val.shape[0]:,} ({X_val.shape[0]/len(X)*100:.1f}%)")
+print(f"  Test:       {X_test.shape[0]:,} ({X_test.shape[0]/len(X)*100:.1f}%)")
+
+# =================================================================================
+# STEP 11: FEATURE SCALING (Section 3.5.5, Equation 3.4)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 11: Feature Scaling (Equation 3.4: z = (x - μ) / σ)")
+print("="*80)
+
+# Z-score normalization
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+print("✓ Z-score normalization applied")
+print(f"  Train mean: {X_train_scaled[:, 0].mean():.6f} (should be ≈ 0)")
+print(f"  Train std:  {X_train_scaled[:, 0].std():.6f} (should be ≈ 1)")
+
+# Save scaler
+scaler_path = os.path.join(OUTPUT_DIR, 'scaler.joblib')
+joblib.dump(scaler, scaler_path)
+print(f"✓ Scaler saved to: {scaler_path}")
+
+# =================================================================================
+# STEP 12: SMOTE FOR CLASS BALANCING (Section 3.5.4, Equation 3.3)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 12: SMOTE - Class Balancing (Equation 3.3)")
+print("="*80)
+
+print("Class distribution BEFORE SMOTE:")
+unique, counts = np.unique(y_train, return_counts=True)
+for class_idx, count in zip(unique, counts):
+    label = "BENIGN" if class_idx == 0 else "ATTACK"
+    print(f"  Class {class_idx} ({label}): {count:,}")
+
+# Apply SMOTE
+smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=5)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train_scaled, y_train)
+
+print("\nClass distribution AFTER SMOTE:")
+unique, counts = np.unique(y_train_resampled, return_counts=True)
+for class_idx, count in zip(unique, counts):
+    label = "BENIGN" if class_idx == 0 else "ATTACK"
+    print(f"  Class {class_idx} ({label}): {count:,}")
+
+print(f"\n✓ SMOTE complete:")
+print(f"  Original: {len(y_train):,} samples")
+print(f"  After SMOTE: {len(y_train_resampled):,} samples")
+print(f"  Synthetic samples created: {len(y_train_resampled) - len(y_train):,}")
+
+# =================================================================================
+# STEP 13: FEATURE SELECTION - CHI-SQUARE & F-STATISTIC (Section 3.6.2)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 13: Additional Feature Selection (Section 3.6.2)")
+print("="*80)
+
+# Chi-square test (Equation 3.7)
+print("\n1. Chi-Square Test (Equation 3.7)")
+X_train_nonneg = X_train_resampled - X_train_resampled.min(axis=0)
+k_chi2 = min(50, len(feature_cols))
+selector_chi2 = SelectKBest(chi2, k=k_chi2)
+selector_chi2.fit(X_train_nonneg, y_train_resampled)
+chi2_scores = pd.Series(selector_chi2.scores_, index=feature_cols).sort_values(ascending=False)
+print(f"  Top 5 features by Chi-square:")
+for idx, (feat, score) in enumerate(chi2_scores.head(5).items(), 1):
+    print(f"    {idx}. {feat}: {score:.2f}")
+
+# F-statistic
+print("\n2. F-Statistic Test")
+k_f = min(50, len(feature_cols))
+selector_f = SelectKBest(f_classif, k=k_f)
+selector_f.fit(X_train_resampled, y_train_resampled)
+f_scores = pd.Series(selector_f.scores_, index=feature_cols).sort_values(ascending=False)
+print(f"  Top 5 features by F-statistic:")
+for idx, (feat, score) in enumerate(f_scores.head(5).items(), 1):
+    print(f"    {idx}. {feat}: {score:.2f}")
+
+# Random Forest importance
+print("\n3. Random Forest Feature Importance")
+rf_selector = RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE, n_jobs=-1)
+rf_selector.fit(X_train_resampled, y_train_resampled)
+rf_importances = pd.Series(rf_selector.feature_importances_, index=feature_cols).sort_values(ascending=False)
+print(f"  Top 5 features by RF importance:")
+for idx, (feat, importance) in enumerate(rf_importances.head(5).items(), 1):
+    print(f"    {idx}. {feat}: {importance:.4f}")
+
+# Ensemble feature selection
+print("\n4. Ensemble Feature Selection")
+top_k = min(40, len(feature_cols))
+chi2_top = set(chi2_scores.head(top_k).index)
+f_top = set(f_scores.head(top_k).index)
+rf_top = set(rf_importances.head(top_k).index)
+
+selected_features_union = list(chi2_top | f_top | rf_top)
+selected_features = selected_features_union[:top_k]
+selected_indices = [feature_cols.index(f) for f in selected_features if f in feature_cols]
+
+print(f"  Selected {len(selected_features)} features using ensemble method")
+
+# Apply selection
+X_train_selected = X_train_resampled[:, selected_indices]
+X_val_selected = X_val_scaled[:, selected_indices]
+X_test_selected = X_test_scaled[:, selected_indices]
+
+# Save selected features
+feature_artifacts = {
+    'selected_features': selected_features,
+    'selected_indices': selected_indices,
+    'chi2_scores': chi2_scores.to_dict(),
+    'f_scores': f_scores.to_dict(),
+    'rf_importances': rf_importances.to_dict()
+}
+artifacts_path = os.path.join(OUTPUT_DIR, 'selected_features.joblib')
+joblib.dump(feature_artifacts, artifacts_path)
+print(f"✓ Feature selection artifacts saved to: {artifacts_path}")
+
+# =================================================================================
+# STEP 14: PCA (OPTIONAL - Section 3.6.3, Equation 3.8)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 14: PCA (Optional - Equation 3.8)")
+print("="*80)
+
+pca = PCA(n_components=0.95, random_state=RANDOM_STATE)
+X_train_pca = pca.fit_transform(X_train_selected)
+X_val_pca = pca.transform(X_val_selected)
+X_test_pca = pca.transform(X_test_selected)
+
+print(f"PCA Results:")
+print(f"  Original features: {X_train_selected.shape[1]}")
+print(f"  Principal components: {X_train_pca.shape[1]}")
+print(f"  Variance explained: {pca.explained_variance_ratio_.sum():.4f}")
+
+# Save PCA
+pca_path = os.path.join(OUTPUT_DIR, 'pca.joblib')
+joblib.dump(pca, pca_path)
+print(f"✓ PCA saved to: {pca_path}")
+
+# Choose feature set (with or without PCA)
+USE_PCA = False  # Set to True to use PCA features
+
+if USE_PCA:
+    X_train_final = X_train_pca
+    X_val_final = X_val_pca
+    X_test_final = X_test_pca
+    print("\n✓ Using PCA-transformed features")
+else:
+    X_train_final = X_train_selected
+    X_val_final = X_val_selected
+    X_test_final = X_test_selected
+    print("\n✓ Using selected features without PCA")
+
+print(f"Final feature matrix: {X_train_final.shape}")
+
+# Free memory
+del X_train, X_temp, X_train_scaled, X_train_nonneg
+gc.collect()
+
+print("\n" + "="*80)
+print("✓ PREPROCESSING & FEATURE ENGINEERING COMPLETE")
+print("="*80)
+print(f"Ready for model training with {X_train_final.shape[1]} features")
+
+
+
+# In[23]:
+
+
+"""
+# =================================================================================
+STEP 15: EVALUATION FUNCTIONS (Section 3.8 - Performance Evaluation)
+Implements Equations 3.18-3.26
+# =================================================================================
+"""
+
+print("\n" + "="*80)
+print("STEP 15: Setting Up Evaluation Functions (Section 3.8)")
+print("="*80)
+
+def comprehensive_evaluation(y_true, y_pred, y_proba=None, model_name="Model"):
+    """
+    Calculate all evaluation metrics as specified in Section 3.8.
+    
+    Implements:
+    - Confusion Matrix (Equation 3.18)
+    - Accuracy (Equation 3.19)
+    - Precision (Equation 3.20)
+    - Recall (Equation 3.21)
+    - F1-Score (Equation 3.22)
+    - MCC (Equation 3.23)
+    - ROC-AUC (Equations 3.24-3.26) for binary classification
+    """
+    
+    # Confusion Matrix (Equation 3.18)
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Accuracy (Equation 3.19): (TP + TN) / (TP + TN + FP + FN)
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    # Precision (Equation 3.20): TP / (TP + FP)
+    precision = precision_score(
+        y_true, y_pred, 
+        average='binary' if BINARY_CLASSIFICATION else 'weighted',
+        zero_division=0
+    )
+    
+    # Recall (Equation 3.21): TP / (TP + FN)
+    recall = recall_score(
+        y_true, y_pred,
+        average='binary' if BINARY_CLASSIFICATION else 'weighted',
+        zero_division=0
+    )
+    
+    # F1-Score (Equation 3.22): 2 * (Precision * Recall) / (Precision + Recall)
+    f1 = f1_score(
+        y_true, y_pred,
+        average='binary' if BINARY_CLASSIFICATION else 'weighted',
+        zero_division=0
+    )
+    
+    # MCC (Equation 3.23): Matthews Correlation Coefficient
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'mcc': mcc
+    }
+    
+    # ROC-AUC (Equations 3.24-3.26) for binary classification
+    if y_proba is not None and BINARY_CLASSIFICATION:
+        try:
+            if y_proba.ndim > 1:
+                y_proba = y_proba[:, 1]
+            auc_score = roc_auc_score(y_true, y_proba)
+            metrics['auc'] = auc_score
+        except Exception as e:
+            print(f"  Warning: Could not calculate AUC - {e}")
+    
+    # Display results
+    print(f"\n{'='*80}")
+    print(f"{model_name} - Evaluation Metrics")
+    print(f"{'='*80}")
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1-Score:  {f1:.4f}")
+    print(f"MCC:       {mcc:.4f}")
+    if 'auc' in metrics:
+        print(f"AUC:       {metrics['auc']:.4f}")
+    
+    print(f"\nConfusion Matrix:")
+    print(cm)
+    
+    # Additional metrics for binary classification
+    if BINARY_CLASSIFICATION and cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        print(f"\nDetailed Metrics:")
+        print(f"  True Negatives:  {tn:,}")
+        print(f"  False Positives: {fp:,}")
+        print(f"  False Negatives: {fn:,}")
+        print(f"  True Positives:  {tp:,}")
+        print(f"  Specificity:     {specificity:.4f}")
+    
+    # Visualize confusion matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True)
+    plt.title(f'Confusion Matrix - {model_name}', fontsize=14, fontweight='bold')
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    
+    # Add class labels
+    if BINARY_CLASSIFICATION:
+        labels = ['BENIGN', 'ATTACK']
+        plt.xticks([0.5, 1.5], labels)
+        plt.yticks([0.5, 1.5], labels)
+    
+    plt.tight_layout()
+    cm_path = os.path.join(FIGURES_DIR, f'cm_{model_name.replace(" ", "_")}.png')
+    plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return metrics, cm
+
+
+def plot_roc_curve(y_true, y_proba, model_name="Model"):
+    """
+    Plot ROC curve for binary classification (Equations 3.24-3.26).
+    
+    TPR (Equation 3.24): TP / (TP + FN)
+    FPR (Equation 3.25): FP / (FP + TN)
+    AUC (Equation 3.26): Area under ROC curve
+    """
+    
+    if not BINARY_CLASSIFICATION or y_proba is None:
+        return
+    
+    if y_proba.ndim > 1:
+        y_proba = y_proba[:, 1]
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, 
+             label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+             label='Random Classifier')
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (FPR)', fontsize=12)
+    plt.ylabel('True Positive Rate (TPR)', fontsize=12)
+    plt.title(f'ROC Curve - {model_name}', fontsize=14, fontweight='bold')
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    roc_path = os.path.join(FIGURES_DIR, f'roc_{model_name.replace(" ", "_")}.png')
+    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+print("✓ Evaluation functions configured")
+
+# =================================================================================
+# STEP 16: MODEL TRAINING WITH CV & GRID SEARCH (Section 3.7)
+# Implements Equations 3.16-3.17
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 16: Model Training Configuration (Section 3.7)")
+print("="*80)
+
+def train_and_evaluate_with_cv(model, param_grid, model_name, X_train, y_train, 
+                                X_val, y_val, X_test, y_test):
+    """
+    Train model with k-fold cross-validation and grid search.
+    
+    Implements:
+    - Stratified K-Fold Cross-Validation (k=5) - Equation 3.16
+    - Grid Search for Hyperparameter Tuning - Equation 3.17
+    
+    Equation 3.16: CV_Score = (1/k) Σ Score_i
+    Equation 3.17: θ* = argmax_θ∈Θ CV_Score(θ)
+    """
+    
+    print(f"\n{'#'*80}")
+    print(f"TRAINING MODEL: {model_name}")
+    print(f"{'#'*80}")
+    
+    # K-fold cross-validation setup (k=5 as per methodology)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    
+    print(f"Configuration:")
+    print(f"  - Cross-validation: 5-fold stratified")
+    print(f"  - Hyperparameter combinations: {np.prod([len(v) for v in param_grid.values()])}")
+    print(f"  - Total fits: {np.prod([len(v) for v in param_grid.values()]) * 5}")
+    
+    # Grid Search (Equation 3.17)
+    grid_search = GridSearchCV(
+        estimator=model,
+        param_grid=param_grid,
+        cv=cv,
+        scoring='f1_weighted' if not BINARY_CLASSIFICATION else 'f1',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    # Training
+    print(f"\nStarting Grid Search...")
+    train_start = time.time()
+    grid_search.fit(X_train, y_train)
+    train_time = time.time() - train_start
+    
+    print(f"\n✓ Training completed in {train_time:.2f} seconds ({train_time/60:.2f} minutes)")
+    
+    # Best model
+    best_model = grid_search.best_estimator_
+    best_params = grid_search.best_params_
+    best_cv_score = grid_search.best_score_
+    
+    print(f"\nBest Hyperparameters:")
+    for param, value in best_params.items():
+        print(f"  {param}: {value}")
+    print(f"\nBest CV F1-Score: {best_cv_score:.4f}")
+    
+    # Cross-validation scores (Equation 3.16)
+    from sklearn.model_selection import cross_val_score
+    cv_scores = cross_val_score(
+        best_model, X_train, y_train, cv=cv, 
+        scoring='f1_weighted' if not BINARY_CLASSIFICATION else 'f1'
+    )
+    
+    print(f"\nCross-Validation Scores (5 folds):")
+    for fold, score in enumerate(cv_scores, 1):
+        print(f"  Fold {fold}: {score:.4f}")
+    print(f"Mean: {cv_scores.mean():.4f} (±{cv_scores.std()*2:.4f})")
+    
+    # Validation set evaluation
+    print(f"\n{'-'*80}")
+    print(f"VALIDATION SET EVALUATION")
+    print(f"{'-'*80}")
+    
+    val_pred = best_model.predict(X_val)
+    val_proba = best_model.predict_proba(X_val) if hasattr(best_model, 'predict_proba') else None
+    
+    val_metrics, val_cm = comprehensive_evaluation(
+        y_val, val_pred, val_proba, f"{model_name}_Validation"
+    )
+    
+    if val_proba is not None:
+        plot_roc_curve(y_val, val_proba, f"{model_name}_Validation")
+    
+    # Test set evaluation
+    print(f"\n{'-'*80}")
+    print(f"TEST SET EVALUATION")
+    print(f"{'-'*80}")
+    
+    # Measure inference time
+    inference_start = time.time()
+    test_pred = best_model.predict(X_test)
+    inference_time = (time.time() - inference_start) / len(X_test)
+    
+    test_proba = best_model.predict_proba(X_test) if hasattr(best_model, 'predict_proba') else None
+    
+    test_metrics, test_cm = comprehensive_evaluation(
+        y_test, test_pred, test_proba, f"{model_name}_Test"
+    )
+    
+    print(f"\nInference Performance:")
+    print(f"  Avg time per sample: {inference_time*1000:.4f} ms")
+    print(f"  Throughput: {1/inference_time:.2f} samples/second")
+    
+    if test_proba is not None:
+        plot_roc_curve(y_test, test_proba, f"{model_name}_Test")
+    
+    # Save model
+    model_path = os.path.join(OUTPUT_DIR, f'{model_name.replace(" ", "_")}_best.joblib')
+    joblib.dump(best_model, model_path)
+    model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+    print(f"\n✓ Model saved: {model_path}")
+    print(f"  Model size: {model_size_mb:.2f} MB")
+    
+    # Compile results
+    results = {
+        'model_name': model_name,
+        'best_params': best_params,
+        'cv_f1_mean': cv_scores.mean(),
+        'cv_f1_std': cv_scores.std(),
+        'cv_scores': cv_scores.tolist(),
+        'train_time_seconds': train_time,
+        'inference_time_ms': inference_time * 1000,
+        'model_size_mb': model_size_mb,
+        'val_metrics': val_metrics,
+        'test_metrics': test_metrics
+    }
+    
+    return best_model, results
+
+print("✓ Training function configured")
+
+# =================================================================================
+# STEP 17: MODEL CONFIGURATIONS (Section 3.7.1)
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 17: Configuring ML Models (Section 3.7.1)")
+print("="*80)
+
+models_config = {
+    # Random Forest (Equation 3.9)
+    'Random_Forest': {
+        'model': RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
+        'params': {
+            'n_estimators': [100, 200],
+            'max_depth': [10, 20, None],
+            'min_samples_split': [2, 5],
+            'min_samples_leaf': [1, 2],
+            'max_features': ['sqrt', 'log2']
+        }
+    },
+    
+    # Gradient Boosting
+    'Gradient_Boosting': {
+        'model': GradientBoostingClassifier(random_state=RANDOM_STATE),
+        'params': {
+            'n_estimators': [100, 200],
+            'learning_rate': [0.01, 0.1],
+            'max_depth': [3, 5],
+            'min_samples_split': [2, 5],
+            'subsample': [0.8, 1.0]
+        }
+    },
+    
+    # KNN (Equations 3.11-3.12)
+    'KNN': {
+        'model': KNeighborsClassifier(n_jobs=-1),
+        'params': {
+            'n_neighbors': [3, 5, 7],
+            'weights': ['uniform', 'distance'],
+            'metric': ['euclidean', 'manhattan']
+        }
+    },
+    
+    # SVM (Equations 3.10-3.11) - Reduced for speed
+    'SVM': {
+        'model': SVC(random_state=RANDOM_STATE, probability=True),
+        'params': {
+            'C': [0.1, 1, 10],
+            'kernel': ['rbf', 'linear'],
+            'gamma': ['scale', 'auto']
+        }
+    },
+    
+    # ANN/MLP (Equations 3.13-3.15)
+    'ANN_MLP': {
+        'model': MLPClassifier(random_state=RANDOM_STATE, max_iter=500),
+        'params': {
+            'hidden_layer_sizes': [(50,), (100,), (100, 50)],
+            'activation': ['relu', 'tanh'],
+            'alpha': [0.0001, 0.001],
+            'learning_rate': ['constant', 'adaptive']
+        }
+    },
+    
+    # Decision Tree
+    'Decision_Tree': {
+        'model': DecisionTreeClassifier(random_state=RANDOM_STATE),
+        'params': {
+            'max_depth': [5, 10, 20],
+            'min_samples_split': [2, 5],
+            'min_samples_leaf': [1, 2],
+            'criterion': ['gini', 'entropy']
+        }
+    }
+}
+
+print(f"Configured {len(models_config)} models:")
+for idx, name in enumerate(models_config.keys(), 1):
+    print(f"  {idx}. {name}")
+
+# =================================================================================
+# STEP 18: TRAIN ALL MODELS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 18: Training Models (Default Parameters)")
+print("="*80)
+
+all_results = {}
+trained_models = {}
+
+# Simple models with default params
+simple_models = {
+    'Random_Forest': RandomForestClassifier(n_estimators=200, max_depth=20, random_state=RANDOM_STATE, n_jobs=-1),
+    'Gradient_Boosting': GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, random_state=RANDOM_STATE),
+    'KNN': KNeighborsClassifier(n_neighbors=5, weights='distance', n_jobs=-1),
+    'Decision_Tree': DecisionTreeClassifier(max_depth=10, random_state=RANDOM_STATE),
+    'ANN_MLP': MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=RANDOM_STATE)
+}
+
+for model_name, model in simple_models.items():
+    print(f"\nTraining {model_name}...")
+    
+    train_start = time.time()
+    model.fit(X_train_final, y_train_resampled)
+    train_time = time.time() - train_start
+    
+    # Validation evaluation
+    val_pred = model.predict(X_val_final)
+    val_proba = model.predict_proba(X_val_final) if hasattr(model, 'predict_proba') else None
+    val_metrics, _ = comprehensive_evaluation(y_val, val_pred, val_proba, f"{model_name}_Val")
+    
+    # Test evaluation
+    test_pred = model.predict(X_test_final)
+    test_proba = model.predict_proba(X_test_final) if hasattr(model, 'predict_proba') else None
+    test_metrics, _ = comprehensive_evaluation(y_test, test_pred, test_proba, f"{model_name}_Test")
+    
+    all_results[model_name] = {
+        'model_name': model_name,
+        'train_time_seconds': train_time,
+        'val_metrics': val_metrics,
+        'test_metrics': test_metrics
+    }
+    trained_models[model_name] = model
+    
+    print(f"✓ {model_name} complete in {train_time:.2f}s")
+
+
+# Add this RIGHT AFTER you split your data into train/test
+# This saves your test data so the post-processing script can use it
+
+np.save(os.path.join(OUTPUT_DIR, 'X_test.npy'), X_test_final)
+np.save(os.path.join(OUTPUT_DIR, 'y_test.npy'), y_test)
+print("✓ Test data saved for post-processing")
+
+        
+
+# =================================================================================
+# STEP 19: COMPARATIVE ANALYSIS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 19: Comparative Analysis")
+print("="*80)
+
+# Create comparison DataFrame
+
+comparison_data = []
+
+for model_name, results in all_results.items():
+    val_metrics = results.get('val_metrics', {})
+    test_metrics = results.get('test_metrics', {})
+
+    row = {
+        'Model': model_name,
+        'CV_F1_Mean': results.get('cv_f1_mean', np.nan),
+        'CV_F1_Std': results.get('cv_f1_std', np.nan),
+        'Val_Accuracy': val_metrics.get('accuracy', np.nan),
+        'Val_Precision': val_metrics.get('precision', np.nan),
+        'Val_Recall': val_metrics.get('recall', np.nan),
+        'Val_F1': val_metrics.get('f1_score', np.nan),
+        'Val_MCC': val_metrics.get('mcc', np.nan),
+        'Test_Accuracy': test_metrics.get('accuracy', np.nan),
+        'Test_Precision': test_metrics.get('precision', np.nan),
+        'Test_Recall': test_metrics.get('recall', np.nan),
+        'Test_F1': test_metrics.get('f1_score', np.nan),
+        'Test_MCC': test_metrics.get('mcc', np.nan),
+        'Train_Time(s)': results.get('train_time_seconds', np.nan),
+        'Inference_Time(ms)': results.get('inference_time_ms', np.nan),
+        'Model_Size(MB)': results.get('model_size_mb', np.nan)
+    }
+
+    if 'auc' in test_metrics:
+        row['Test_AUC'] = test_metrics['auc']
+
+comparison_data.append(row)
+
+comparison_df = pd.DataFrame(comparison_data)
+
+        
+comparison_df = comparison_df.sort_values('Test_F1', ascending=False)
+
+print("\nModel Performance Comparison (sorted by Test F1-Score):")
+print("="*80)
+print(comparison_df.to_string(index=False))
+
+# Save comparison
+comparison_csv = os.path.join(OUTPUT_DIR, 'model_comparison.csv')
+comparison_df.to_csv(comparison_csv, index=False)
+print(f"\n✓ Comparison saved to: {comparison_csv}")
+
+# =================================================================================
+# STEP 20: VISUALIZATIONS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 20: Generating Visualizations")
+print("="*80)
+
+# Performance comparison plot
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle('Model Comparison - Test Set Performance', fontsize=16, fontweight='bold')
+
+metrics_to_plot = ['Test_Accuracy', 'Test_Precision', 'Test_Recall', 
+                   'Test_F1', 'Test_MCC', 'Train_Time(s)']
+colors = plt.cm.Set3(range(len(comparison_df)))
+
+for idx, metric in enumerate(metrics_to_plot):
+    ax = axes[idx // 3, idx % 3]
+    bars = ax.barh(comparison_df['Model'], comparison_df[metric], color=colors)
+    ax.set_xlabel(metric.replace('_', ' '), fontsize=10)
+    ax.set_title(metric.replace('_', ' '), fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    for bar in bars:
+        width = bar.get_width()
+        ax.text(width, bar.get_y() + bar.get_height()/2, 
+               f'{width:.3f}', ha='left', va='center', fontsize=9)
+
+plt.tight_layout()
+comp_path = os.path.join(FIGURES_DIR, 'model_comparison.png')
+plt.savefig(comp_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Performance comparison saved to: {comp_path}")
+
+# Efficiency comparison
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].barh(comparison_df['Model'], comparison_df['Train_Time(s)'], color=colors)
+axes[0].set_xlabel('Training Time (seconds)')
+axes[0].set_title('Training Time Comparison')
+axes[0].grid(True, alpha=0.3, axis='x')
+
+axes[1].barh(comparison_df['Model'], comparison_df['Inference_Time(ms)'], color=colors)
+axes[1].set_xlabel('Inference Time (ms per sample)')
+axes[1].set_title('Inference Time Comparison')
+axes[1].grid(True, alpha=0.3, axis='x')
+
+plt.tight_layout()
+eff_path = os.path.join(FIGURES_DIR, 'efficiency_comparison.png')
+plt.savefig(eff_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Efficiency comparison saved to: {eff_path}")
+
+# =================================================================================
+# STEP 21: BEST MODEL ANALYSIS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 21: Best Model Analysis")
+print("="*80)
+
+best_model_name = comparison_df.iloc[0]['Model']
+best_model = trained_models[best_model_name]
+best_results = all_results[best_model_name]
+
+print(f"\n🏆 BEST MODEL: {best_model_name}")
+print("="*80)
+print(f"\nTest Performance:")
+print(f"  F1-Score:  {best_results['test_metrics']['f1_score']:.4f}")
+print(f"  Accuracy:  {best_results['test_metrics']['accuracy']:.4f}")
+print(f"  Precision: {best_results['test_metrics']['precision']:.4f}")
+print(f"  Recall:    {best_results['test_metrics']['recall']:.4f}")
+print(f"  MCC:       {best_results['test_metrics']['mcc']:.4f}")
+
+# Feature importance (if available)
+if hasattr(best_model, 'feature_importances_'):
+    importances = best_model.feature_importances_
+    indices = np.argsort(importances)[::-1][:20]
+    
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(indices)), importances[indices], color='steelblue')
+    top_features = [selected_features[i] if i < len(selected_features) 
+                   else f'Feature_{i}' for i in indices]
+    plt.yticks(range(len(indices)), top_features)
+    plt.xlabel('Feature Importance', fontsize=12)
+    plt.title(f'Top 20 Features - {best_model_name}', fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    
+    imp_path = os.path.join(FIGURES_DIR, f'feature_importance_{best_model_name}.png')
+    plt.savefig(imp_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\n✓ Feature importance plot saved to: {imp_path}")
+
+# =================================================================================
+# STEP 22: SAVE FINAL REPORT
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 22: Saving Final Report")
+print("="*80)
+
+final_report = {
+    'configuration': {
+        'binary_classification': BINARY_CLASSIFICATION,
+        'random_state': RANDOM_STATE,
+        'train_size': len(y_train_resampled),
+        'val_size': len(y_val),
+        'test_size': len(y_test),
+        'selected_features': len(selected_features),
+        'pca_used': USE_PCA,
+        'smote_applied': True,
+        'cv_folds': 5
+    },
+    'results': all_results,
+    'comparison': comparison_df.to_dict('records'),
+    'best_model': {
+        'name': best_model_name,
+        'metrics': best_results
+    }
+}
+
+# Save as joblib
+report_path = os.path.join(OUTPUT_DIR, 'final_report.joblib')
+joblib.dump(final_report, report_path)
+print(f"✓ Report (joblib) saved to: {report_path}")
+
+# Save as JSON
+import json
+
+def convert_to_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64)):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(i) for i in obj]
+    return obj
+
+report_json = os.path.join(OUTPUT_DIR, 'final_report.json')
+with open(report_json, 'w') as f:
+    json.dump(convert_to_serializable(final_report), f, indent=2)
+print(f"✓ Report (JSON) saved to: {report_json}")
+
+# =================================================================================
+# FINAL SUMMARY
+# =================================================================================
+
+print("\n" + "="*80)
+print("✓ ANALYSIS COMPLETE")
+print("="*80)
+
+print(f"\n📊 Summary:")
+print(f"  Models trained: {len(all_results)}")
+print(f"  Best model: {best_model_name}")
+print(f"  Best Test F1: {best_results['test_metrics']['f1_score']:.4f}")
+print(f"  Best Test Accuracy: {best_results['test_metrics']['accuracy']:.4f}")
+
+print(f"\n📁 Output Locations:")
+print(f"  Models: {OUTPUT_DIR}")
+print(f"  Figures: {FIGURES_DIR}")
+print(f"  Comparison: {comparison_csv}")
+
+print(f"\n📈 Generated Files:")
+print(f"  ✓ {len(all_results)} trained models (.joblib)")
+print(f"  ✓ Preprocessing artifacts (scaler, imputer, PCA, features)")
+print(f"  ✓ Confusion matrices for all models")
+print(f"  ✓ ROC curves (if binary classification)")
+print(f"  ✓ Performance comparison charts")
+print(f"  ✓ Feature importance (for best model)")
+print(f"  ✓ Final reports (joblib & JSON)")
+
+print(f"\n✓ All tasks completed successfully!")
+print("="*80)
+
+
+# In[ ]:
+
+
+
+
+
+# In[28]:
+
+
+import os
+print(os.getcwd())
+
+
+# In[29]:
+
+
+"""
+STEP 15-22: MODEL TRAINING, EVALUATION & ANALYSIS
+Complete pipeline with proper CSV outputs
+"""
+
+print("\n" + "="*80)
+print("STEP 15: Setting Up Evaluation Functions (Section 3.8)")
+print("="*80)
+
+def comprehensive_evaluation(y_true, y_pred, y_proba=None, model_name="Model"):
+    """Calculate all evaluation metrics and return them."""
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'mcc': mcc
+    }
+    
+    # ROC-AUC for binary classification
+    if y_proba is not None and BINARY_CLASSIFICATION:
+        try:
+            if y_proba.ndim > 1:
+                y_proba = y_proba[:, 1]
+            auc_score = roc_auc_score(y_true, y_proba)
+            metrics['auc'] = auc_score
+        except Exception as e:
+            print(f"  Warning: Could not calculate AUC - {e}")
+            metrics['auc'] = np.nan
+    
+    # Display results
+    print(f"\n{model_name} - Evaluation Metrics:")
+    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-Score:  {f1:.4f}")
+    print(f"  MCC:       {mcc:.4f}")
+    if 'auc' in metrics and not np.isnan(metrics['auc']):
+        print(f"  AUC:       {metrics['auc']:.4f}")
+    
+    # Additional metrics for binary classification
+    if BINARY_CLASSIFICATION and cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        metrics['specificity'] = specificity
+        metrics['sensitivity'] = sensitivity
+        metrics['tn'] = tn
+        metrics['fp'] = fp
+        metrics['fn'] = fn
+        metrics['tp'] = tp
+    
+    # Save confusion matrix plot
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True)
+    plt.title(f'Confusion Matrix - {model_name}', fontsize=14, fontweight='bold')
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    
+    if BINARY_CLASSIFICATION:
+        labels = ['BENIGN', 'ATTACK']
+        plt.xticks([0.5, 1.5], labels)
+        plt.yticks([0.5, 1.5], labels)
+    
+    plt.tight_layout()
+    cm_path = os.path.join(FIGURES_DIR, f'cm_{model_name.replace(" ", "_")}.png')
+    plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return metrics, cm
+
+
+def plot_roc_curve(y_true, y_proba, model_name="Model"):
+    """Plot ROC curve for binary classification."""
+    
+    if not BINARY_CLASSIFICATION or y_proba is None:
+        return
+    
+    if y_proba.ndim > 1:
+        y_proba = y_proba[:, 1]
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (FPR)', fontsize=12)
+    plt.ylabel('True Positive Rate (TPR)', fontsize=12)
+    plt.title(f'ROC Curve - {model_name}', fontsize=14, fontweight='bold')
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    roc_path = os.path.join(FIGURES_DIR, f'roc_{model_name.replace(" ", "_")}.png')
+    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+print("✓ Evaluation functions configured")
+
+
+# =================================================================================
+# STEP 16-17: MODEL CONFIGURATIONS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 16-17: Configuring ML Models")
+print("="*80)
+
+# Define models with reasonable parameters for 8GB RAM
+models_config = {
+    'Random_Forest': RandomForestClassifier(
+        n_estimators=200, max_depth=20, min_samples_split=5,
+        random_state=RANDOM_STATE, n_jobs=-1
+    ),
+    'Gradient_Boosting': GradientBoostingClassifier(
+        n_estimators=100, learning_rate=0.1, max_depth=5,
+        random_state=RANDOM_STATE
+    ),
+    'KNN': KNeighborsClassifier(
+        n_neighbors=5, weights='distance', n_jobs=-1
+    ),
+    'Decision_Tree': DecisionTreeClassifier(
+        max_depth=15, min_samples_split=5, random_state=RANDOM_STATE
+    ),
+    'ANN_MLP': MLPClassifier(
+        hidden_layer_sizes=(100, 50), max_iter=500, 
+        random_state=RANDOM_STATE, early_stopping=True
+    )
+}
+
+print(f"Configured {len(models_config)} models:")
+for idx, name in enumerate(models_config.keys(), 1):
+    print(f"  {idx}. {name}")
+
+
+# =================================================================================
+# STEP 18: TRAIN ALL MODELS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 18: Training All Models")
+print("="*80)
+
+all_results = []
+trained_models = {}
+
+for model_name, model in models_config.items():
+    print(f"\n{'='*80}")
+    print(f"Training: {model_name}")
+    print(f"{'='*80}")
+    
+    try:
+        # Training
+        train_start = time.time()
+        model.fit(X_train_final, y_train_resampled)
+        train_time = time.time() - train_start
+        print(f"✓ Training completed in {train_time:.2f} seconds")
+        
+        # Validation evaluation
+        print("\nValidation Set Evaluation:")
+        val_pred = model.predict(X_val_final)
+        val_proba = model.predict_proba(X_val_final) if hasattr(model, 'predict_proba') else None
+        val_metrics, val_cm = comprehensive_evaluation(y_val, val_pred, val_proba, f"{model_name}_Val")
+        
+        if val_proba is not None and BINARY_CLASSIFICATION:
+            plot_roc_curve(y_val, val_proba, f"{model_name}_Val")
+        
+        # Test evaluation
+        print("\nTest Set Evaluation:")
+        inference_start = time.time()
+        test_pred = model.predict(X_test_final)
+        inference_time = (time.time() - inference_start) / len(X_test_final)
+        
+        test_proba = model.predict_proba(X_test_final) if hasattr(model, 'predict_proba') else None
+        test_metrics, test_cm = comprehensive_evaluation(y_test, test_pred, test_proba, f"{model_name}_Test")
+        
+        if test_proba is not None and BINARY_CLASSIFICATION:
+            plot_roc_curve(y_test, test_proba, f"{model_name}_Test")
+        
+        print(f"\nInference: {inference_time*1000:.4f} ms per sample")
+        
+        # Save model
+        model_path = os.path.join(OUTPUT_DIR, f'{model_name}_model.joblib')
+        joblib.dump(model, model_path)
+        model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        
+        # Store results
+        result = {
+            'Model': model_name,
+            'Train_Time_sec': train_time,
+            'Inference_Time_ms': inference_time * 1000,
+            'Model_Size_MB': model_size_mb,
+            
+            # Validation metrics
+            'Val_Accuracy': val_metrics['accuracy'],
+            'Val_Precision': val_metrics['precision'],
+            'Val_Recall': val_metrics['recall'],
+            'Val_F1_Score': val_metrics['f1_score'],
+            'Val_MCC': val_metrics['mcc'],
+            'Val_AUC': val_metrics.get('auc', np.nan),
+            
+            # Test metrics
+            'Test_Accuracy': test_metrics['accuracy'],
+            'Test_Precision': test_metrics['precision'],
+            'Test_Recall': test_metrics['recall'],
+            'Test_F1_Score': test_metrics['f1_score'],
+            'Test_MCC': test_metrics['mcc'],
+            'Test_AUC': test_metrics.get('auc', np.nan),
+        }
+        
+        # Add confusion matrix values for binary classification
+        if BINARY_CLASSIFICATION:
+            result.update({
+                'Val_TN': val_metrics.get('tn', np.nan),
+                'Val_FP': val_metrics.get('fp', np.nan),
+                'Val_FN': val_metrics.get('fn', np.nan),
+                'Val_TP': val_metrics.get('tp', np.nan),
+                'Val_Specificity': val_metrics.get('specificity', np.nan),
+                'Val_Sensitivity': val_metrics.get('sensitivity', np.nan),
+                
+                'Test_TN': test_metrics.get('tn', np.nan),
+                'Test_FP': test_metrics.get('fp', np.nan),
+                'Test_FN': test_metrics.get('fn', np.nan),
+                'Test_TP': test_metrics.get('tp', np.nan),
+                'Test_Specificity': test_metrics.get('specificity', np.nan),
+                'Test_Sensitivity': test_metrics.get('sensitivity', np.nan),
+            })
+        
+        all_results.append(result)
+        trained_models[model_name] = model
+        
+        print(f"\n✓ {model_name} complete!")
+        
+    except Exception as e:
+        print(f"\n✗ Error training {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print(f"\n{'='*80}")
+print(f"✓ Training Complete: {len(all_results)}/{len(models_config)} models")
+print(f"{'='*80}")
+
+
+# =================================================================================
+# STEP 19: SAVE COMPREHENSIVE RESULTS TO CSV
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 19: Saving Comprehensive Results")
+print("="*80)
+
+# Create comprehensive results DataFrame
+results_df = pd.DataFrame(all_results)
+results_df = results_df.sort_values('Test_F1_Score', ascending=False).reset_index(drop=True)
+
+# Save main results
+main_results_path = os.path.join(OUTPUT_DIR, 'ALL_MODELS_RESULTS.csv')
+results_df.to_csv(main_results_path, index=False, float_format='%.6f')
+print(f"✓ Main results saved: {main_results_path}")
+
+# Save validation metrics only
+val_cols = ['Model'] + [col for col in results_df.columns if col.startswith('Val_')]
+val_results_path = os.path.join(OUTPUT_DIR, 'VALIDATION_RESULTS.csv')
+results_df[val_cols].to_csv(val_results_path, index=False, float_format='%.6f')
+print(f"✓ Validation results saved: {val_results_path}")
+
+# Save test metrics only
+test_cols = ['Model'] + [col for col in results_df.columns if col.startswith('Test_')]
+test_results_path = os.path.join(OUTPUT_DIR, 'TEST_RESULTS.csv')
+results_df[test_cols].to_csv(test_results_path, index=False, float_format='%.6f')
+print(f"✓ Test results saved: {test_results_path}")
+
+# Save performance metrics (timing, size)
+perf_cols = ['Model', 'Train_Time_sec', 'Inference_Time_ms', 'Model_Size_MB']
+perf_results_path = os.path.join(OUTPUT_DIR, 'PERFORMANCE_METRICS.csv')
+results_df[perf_cols].to_csv(perf_results_path, index=False, float_format='%.6f')
+print(f"✓ Performance metrics saved: {perf_results_path}")
+
+# Display summary table
+print("\n" + "="*80)
+print("SUMMARY: All Models Performance")
+print("="*80)
+print(results_df[['Model', 'Test_Accuracy', 'Test_Precision', 'Test_Recall', 'Test_F1_Score', 'Test_MCC']].to_string(index=False))
+
+
+# =================================================================================
+# STEP 20: ENHANCED VISUALIZATIONS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 20: Generating Visualizations")
+print("="*80)
+
+# 1. Performance Metrics Comparison (Bar Charts)
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle('Model Performance Comparison - Test Set', fontsize=16, fontweight='bold')
+
+metrics_to_plot = ['Test_Accuracy', 'Test_Precision', 'Test_Recall', 'Test_F1_Score', 'Test_MCC']
+if 'Test_AUC' in results_df.columns and not results_df['Test_AUC'].isna().all():
+    metrics_to_plot.append('Test_AUC')
+
+colors = plt.cm.Set3(range(len(results_df)))
+
+for idx, metric in enumerate(metrics_to_plot):
+    row, col = idx // 3, idx % 3
+    ax = axes[row, col]
+    
+    bars = ax.barh(results_df['Model'], results_df[metric], color=colors)
+    ax.set_xlabel(metric.replace('_', ' '), fontsize=11)
+    ax.set_title(metric.replace('_', ' '), fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    # Add value labels
+    for bar in bars:
+        width = bar.get_width()
+        if not np.isnan(width):
+            ax.text(width, bar.get_y() + bar.get_height()/2, 
+                   f'{width:.4f}', ha='left', va='center', fontsize=9)
+
+# Hide extra subplot if needed
+if len(metrics_to_plot) < 6:
+    axes[1, 2].axis('off')
+
+plt.tight_layout()
+comp_path = os.path.join(FIGURES_DIR, 'performance_comparison.png')
+plt.savefig(comp_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Performance comparison saved: {comp_path}")
+
+
+# 2. Efficiency Comparison (Training & Inference Time)
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+axes[0].barh(results_df['Model'], results_df['Train_Time_sec'], color=colors)
+axes[0].set_xlabel('Training Time (seconds)', fontsize=12)
+axes[0].set_title('Training Time Comparison', fontsize=14, fontweight='bold')
+axes[0].grid(True, alpha=0.3, axis='x')
+for i, (model, time_val) in enumerate(zip(results_df['Model'], results_df['Train_Time_sec'])):
+    axes[0].text(time_val, i, f' {time_val:.2f}s', va='center', fontsize=9)
+
+axes[1].barh(results_df['Model'], results_df['Inference_Time_ms'], color=colors)
+axes[1].set_xlabel('Inference Time (ms per sample)', fontsize=12)
+axes[1].set_title('Inference Time Comparison', fontsize=14, fontweight='bold')
+axes[1].grid(True, alpha=0.3, axis='x')
+for i, (model, time_val) in enumerate(zip(results_df['Model'], results_df['Inference_Time_ms'])):
+    axes[1].text(time_val, i, f' {time_val:.4f}ms', va='center', fontsize=9)
+
+plt.tight_layout()
+eff_path = os.path.join(FIGURES_DIR, 'efficiency_comparison.png')
+plt.savefig(eff_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Efficiency comparison saved: {eff_path}")
+
+
+# 3. Radar Chart for Best 3 Models (Different visualization style)
+if len(results_df) >= 3:
+    from math import pi
+    
+    top_3_models = results_df.head(3)
+    categories = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'MCC']
+    
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+    
+    angles = [n / float(len(categories)) * 2 * pi for n in range(len(categories))]
+    angles += angles[:1]
+    
+    ax.set_theta_offset(pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, size=12)
+    
+    for idx, row in top_3_models.iterrows():
+        values = [
+            row['Test_Accuracy'],
+            row['Test_Precision'],
+            row['Test_Recall'],
+            row['Test_F1_Score'],
+            row['Test_MCC']
+        ]
+        values += values[:1]
+        
+        ax.plot(angles, values, 'o-', linewidth=2, label=row['Model'])
+        ax.fill(angles, values, alpha=0.15)
+    
+    ax.set_ylim(0, 1)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=11)
+    ax.set_title('Top 3 Models - Performance Radar', size=16, fontweight='bold', pad=20)
+    ax.grid(True)
+    
+    plt.tight_layout()
+    radar_path = os.path.join(FIGURES_DIR, 'top3_radar_chart.png')
+    plt.savefig(radar_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Radar chart saved: {radar_path}")
+
+
+# 4. Confusion Matrix Heatmap Comparison (for binary classification)
+if BINARY_CLASSIFICATION and len(results_df) > 0:
+    n_models = len(results_df)
+    fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 5))
+    if n_models == 1:
+        axes = [axes]
+    
+    fig.suptitle('Confusion Matrices - All Models', fontsize=16, fontweight='bold')
+    
+    for idx, (ax, model_name) in enumerate(zip(axes, results_df['Model'])):
+        model = trained_models[model_name]
+        test_pred = model.predict(X_test_final)
+        cm = confusion_matrix(y_test, test_pred)
+        
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True)
+        ax.set_title(model_name, fontsize=12, fontweight='bold')
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_xticklabels(['BENIGN', 'ATTACK'])
+        ax.set_yticklabels(['BENIGN', 'ATTACK'])
+    
+    plt.tight_layout()
+    cm_comp_path = os.path.join(FIGURES_DIR, 'confusion_matrices_all.png')
+    plt.savefig(cm_comp_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Confusion matrix comparison saved: {cm_comp_path}")
+
+
+# =================================================================================
+# STEP 21: BEST MODEL ANALYSIS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 21: Best Model Analysis")
+print("="*80)
+
+best_model_row = results_df.iloc[0]
+best_model_name = best_model_row['Model']
+best_model = trained_models[best_model_name]
+
+print(f"\n🏆 BEST MODEL: {best_model_name}")
+print("="*80)
+print(f"Test F1-Score:  {best_model_row['Test_F1_Score']:.4f}")
+print(f"Test Accuracy:  {best_model_row['Test_Accuracy']:.4f}")
+print(f"Test Precision: {best_model_row['Test_Precision']:.4f}")
+print(f"Test Recall:    {best_model_row['Test_Recall']:.4f}")
+print(f"Test MCC:       {best_model_row['Test_MCC']:.4f}")
+
+# Feature importance
+if hasattr(best_model, 'feature_importances_'):
+    importances = best_model.feature_importances_
+    feature_importance_df = pd.DataFrame({
+        'Feature': selected_features,
+        'Importance': importances
+    }).sort_values('Importance', ascending=False)
+    
+    # Save feature importance to CSV
+    feat_imp_path = os.path.join(OUTPUT_DIR, f'FEATURE_IMPORTANCE_{best_model_name}.csv')
+    feature_importance_df.to_csv(feat_imp_path, index=False)
+    print(f"\n✓ Feature importance saved: {feat_imp_path}")
+    
+    # Plot top 20 features
+    top_20 = feature_importance_df.head(20)
+    
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(top_20)), top_20['Importance'], color='steelblue')
+    plt.yticks(range(len(top_20)), top_20['Feature'])
+    plt.xlabel('Importance', fontsize=12)
+    plt.title(f'Top 20 Features - {best_model_name}', fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    
+    imp_plot_path = os.path.join(FIGURES_DIR, f'feature_importance_{best_model_name}.png')
+    plt.savefig(imp_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Feature importance plot saved: {imp_plot_path}")
+
+
+# =================================================================================
+# STEP 22: FINAL SUMMARY REPORT
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 22: Final Summary Report")
+print("="*80)
+
+# Create detailed summary report
+summary_report = {
+    'Experiment_Configuration': {
+        'Binary_Classification': BINARY_CLASSIFICATION,
+        'Random_State': RANDOM_STATE,
+        'Training_Samples': len(y_train_resampled),
+        'Validation_Samples': len(y_val),
+        'Test_Samples': len(y_test),
+        'Selected_Features': len(selected_features),
+        'PCA_Used': USE_PCA,
+        'SMOTE_Applied': True,
+        'Total_Models_Trained': len(all_results)
+    },
+    'Best_Model': {
+        'Name': best_model_name,
+        'Test_F1': float(best_model_row['Test_F1_Score']),
+        'Test_Accuracy': float(best_model_row['Test_Accuracy']),
+        'Test_Precision': float(best_model_row['Test_Precision']),
+        'Test_Recall': float(best_model_row['Test_Recall']),
+        'Training_Time_sec': float(best_model_row['Train_Time_sec']),
+        'Inference_Time_ms': float(best_model_row['Inference_Time_ms'])
+    }
+}
+
+# Save summary as JSON
+import json
+summary_json_path = os.path.join(OUTPUT_DIR, 'EXPERIMENT_SUMMARY.json')
+with open(summary_json_path, 'w') as f:
+    json.dump(summary_report, f, indent=2)
+print(f"✓ Experiment summary saved: {summary_json_path}")
+
+# Save summary as text file
+summary_txt_path = os.path.join(OUTPUT_DIR, 'EXPERIMENT_SUMMARY.txt')
+with open(summary_txt_path, 'w') as f:
+    f.write("="*80 + "\n")
+    f.write("CICIDS2017 INTRUSION DETECTION - EXPERIMENT SUMMARY\n")
+    f.write("="*80 + "\n\n")
+    
+    f.write("CONFIGURATION:\n")
+    f.write("-"*80 + "\n")
+    for key, value in summary_report['Experiment_Configuration'].items():
+        f.write(f"{key.replace('_', ' ')}: {value}\n")
+    
+    f.write("\n" + "="*80 + "\n")
+    f.write("BEST MODEL: " + best_model_name + "\n")
+    f.write("="*80 + "\n")
+    for key, value in summary_report['Best_Model'].items():
+        if key != 'Name':
+            f.write(f"{key.replace('_', ' ')}: {value:.6f}\n")
+    
+    f.write("\n" + "="*80 + "\n")
+    f.write("ALL MODELS RANKING (by Test F1-Score):\n")
+    f.write("="*80 + "\n")
+    for idx, row in results_df.iterrows():
+        f.write(f"{idx+1}. {row['Model']}: {row['Test_F1_Score']:.4f}\n")
+
+print(f"✓ Text summary saved: {summary_txt_path}")
+
+
+# =================================================================================
+# FINAL OUTPUT SUMMARY
+# =================================================================================
+
+print("\n" + "="*80)
+print("✓✓✓ ANALYSIS COMPLETE ✓✓✓")
+print("="*80)
+
+print(f"\n📊 Results Summary:")
+print(f"  Total models trained: {len(all_results)}")
+print(f"  Best model: {best_model_name}")
+print(f"  Best F1-Score: {best_model_row['Test_F1_Score']:.4f}")
+print(f"  Best Accuracy: {best_model_row['Test_Accuracy']:.4f}")
+
+print(f"\n📁 Output Files (CSV):")
+print(f"  1. {main_results_path}")
+print(f"  2. {val_results_path}")
+print(f"  3. {test_results_path}")
+print(f"  4. {perf_results_path}")
+if hasattr(best_model, 'feature_importances_'):
+    print(f"  5. {feat_imp_path}")
+
+print(f"\n📈 Visualizations:")
+print(f"  1. Performance comparison (bar charts)")
+print(f"  2. Efficiency comparison (training/inference)")
+print(f"  3. Top 3 models radar chart")
+if BINARY_CLASSIFICATION:
+    print(f"  4. Confusion matrices comparison")
+    print(f"  5. Individual ROC curves")
+if hasattr(best_model, 'feature_importances_'):
+    print(f"  6. Feature importance plot")
+
+print(f"\n📂 All files saved in:")
+print(f"  Models & Results: {OUTPUT_DIR}")
+print(f"  Figures: {FIGURES_DIR}")
+
+print("\n✓ All tasks completed successfully!")
+print("="*80)
+
+
+# In[ ]:
+
+
+import os
+
+# Base directory
+BASE_DIR = r"C:\Users\Dell\Machine Learning Works"
+
+# Create experiment folder
+EXPERIMENT_NAME = "CICIDS2017_IDS_Experiment"
+OUTPUT_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Create subfolders
+MODELS_DIR = os.path.join(OUTPUT_DIR, "models")
+FIGURES_DIR = os.path.join(OUTPUT_DIR, "figures")
+CSV_DIR = os.path.join(OUTPUT_DIR, "csv_results")
+REPORTS_DIR = os.path.join(OUTPUT_DIR, "reports")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(FIGURES_DIR, exist_ok=True)
+os.makedirs(CSV_DIR, exist_ok=True)
+os.makedirs(REPORTS_DIR, exist_ok=True)
+
+print("Directory structure created:")
+print(f"  Main: {OUTPUT_DIR}")
+print(f"  Models: {MODELS_DIR}")
+print(f"  Figures: {FIGURES_DIR}")
+print(f"  CSV: {CSV_DIR}")
+print(f"  Reports: {REPORTS_DIR}")
+
+"""
+STEP 15-22: MODEL TRAINING, EVALUATION & ANALYSIS
+Complete pipeline with proper CSV outputs
+"""
+
+print("\n" + "="*80)
+print("STEP 15: Setting Up Evaluation Functions (Section 3.8)")
+print("="*80)
+
+def comprehensive_evaluation(y_true, y_pred, y_proba=None, model_name="Model"):
+    """Calculate all evaluation metrics and return them."""
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='binary' if BINARY_CLASSIFICATION else 'weighted', zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'mcc': mcc
+    }
+    
+    # ROC-AUC for binary classification
+    if y_proba is not None and BINARY_CLASSIFICATION:
+        try:
+            if y_proba.ndim > 1:
+                y_proba = y_proba[:, 1]
+            auc_score = roc_auc_score(y_true, y_proba)
+            metrics['auc'] = auc_score
+        except Exception as e:
+            print(f"  Warning: Could not calculate AUC - {e}")
+            metrics['auc'] = np.nan
+    
+    # Display results
+    print(f"\n{model_name} - Evaluation Metrics:")
+    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-Score:  {f1:.4f}")
+    print(f"  MCC:       {mcc:.4f}")
+    if 'auc' in metrics and not np.isnan(metrics['auc']):
+        print(f"  AUC:       {metrics['auc']:.4f}")
+    
+    # Additional metrics for binary classification
+    if BINARY_CLASSIFICATION and cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        metrics['specificity'] = specificity
+        metrics['sensitivity'] = sensitivity
+        metrics['tn'] = tn
+        metrics['fp'] = fp
+        metrics['fn'] = fn
+        metrics['tp'] = tp
+    
+    # Save confusion matrix plot
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True)
+    plt.title(f'Confusion Matrix - {model_name}', fontsize=14, fontweight='bold')
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    
+    if BINARY_CLASSIFICATION:
+        labels = ['BENIGN', 'ATTACK']
+        plt.xticks([0.5, 1.5], labels)
+        plt.yticks([0.5, 1.5], labels)
+    
+    plt.tight_layout()
+    cm_path = os.path.join(FIGURES_DIR, f'cm_{model_name.replace(" ", "_")}.png')
+    plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return metrics, cm
+
+
+def plot_roc_curve(y_true, y_proba, model_name="Model"):
+    """Plot ROC curve for binary classification."""
+    
+    if not BINARY_CLASSIFICATION or y_proba is None:
+        return
+    
+    if y_proba.ndim > 1:
+        y_proba = y_proba[:, 1]
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (FPR)', fontsize=12)
+    plt.ylabel('True Positive Rate (TPR)', fontsize=12)
+    plt.title(f'ROC Curve - {model_name}', fontsize=14, fontweight='bold')
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    roc_path = os.path.join(FIGURES_DIR, f'roc_{model_name.replace(" ", "_")}.png')
+    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+print("✓ Evaluation functions configured")
+
+
+# =================================================================================
+# STEP 16-17: MODEL CONFIGURATIONS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 16-17: Configuring ML Models")
+print("="*80)
+
+# Define models with reasonable parameters for 8GB RAM
+models_config = {
+    'Random_Forest': RandomForestClassifier(
+        n_estimators=200, max_depth=20, min_samples_split=5,
+        random_state=RANDOM_STATE, n_jobs=-1
+    ),
+    'Gradient_Boosting': GradientBoostingClassifier(
+        n_estimators=100, learning_rate=0.1, max_depth=5,
+        random_state=RANDOM_STATE
+    ),
+    'KNN': KNeighborsClassifier(
+        n_neighbors=5, weights='distance', n_jobs=-1
+    ),
+    'Decision_Tree': DecisionTreeClassifier(
+        max_depth=15, min_samples_split=5, random_state=RANDOM_STATE
+    ),
+    'ANN_MLP': MLPClassifier(
+        hidden_layer_sizes=(100, 50), max_iter=500, 
+        random_state=RANDOM_STATE, early_stopping=True
+    )
+}
+
+print(f"Configured {len(models_config)} models:")
+for idx, name in enumerate(models_config.keys(), 1):
+    print(f"  {idx}. {name}")
+
+
+# =================================================================================
+# STEP 18: TRAIN ALL MODELS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 18: Training All Models")
+print("="*80)
+
+all_results = []
+trained_models = {}
+
+for model_name, model in models_config.items():
+    print(f"\n{'='*80}")
+    print(f"Training: {model_name}")
+    print(f"{'='*80}")
+    
+    try:
+        # Training
+        train_start = time.time()
+        model.fit(X_train_final, y_train_resampled)
+        train_time = time.time() - train_start
+        print(f"✓ Training completed in {train_time:.2f} seconds")
+        
+        # Validation evaluation
+        print("\nValidation Set Evaluation:")
+        val_pred = model.predict(X_val_final)
+        val_proba = model.predict_proba(X_val_final) if hasattr(model, 'predict_proba') else None
+        val_metrics, val_cm = comprehensive_evaluation(y_val, val_pred, val_proba, f"{model_name}_Val")
+        
+        if val_proba is not None and BINARY_CLASSIFICATION:
+            plot_roc_curve(y_val, val_proba, f"{model_name}_Val")
+        
+        # Test evaluation
+        print("\nTest Set Evaluation:")
+        inference_start = time.time()
+        test_pred = model.predict(X_test_final)
+        inference_time = (time.time() - inference_start) / len(X_test_final)
+        
+        test_proba = model.predict_proba(X_test_final) if hasattr(model, 'predict_proba') else None
+        test_metrics, test_cm = comprehensive_evaluation(y_test, test_pred, test_proba, f"{model_name}_Test")
+        
+        if test_proba is not None and BINARY_CLASSIFICATION:
+            plot_roc_curve(y_test, test_proba, f"{model_name}_Test")
+        
+        print(f"\nInference: {inference_time*1000:.4f} ms per sample")
+        
+        # Save model
+        model_path = os.path.join(OUTPUT_DIR, f'{model_name}_model.joblib')
+        joblib.dump(model, model_path)
+        model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        
+        # Store results
+        result = {
+            'Model': model_name,
+            'Train_Time_sec': train_time,
+            'Inference_Time_ms': inference_time * 1000,
+            'Model_Size_MB': model_size_mb,
+            
+            # Validation metrics
+            'Val_Accuracy': val_metrics['accuracy'],
+            'Val_Precision': val_metrics['precision'],
+            'Val_Recall': val_metrics['recall'],
+            'Val_F1_Score': val_metrics['f1_score'],
+            'Val_MCC': val_metrics['mcc'],
+            'Val_AUC': val_metrics.get('auc', np.nan),
+            
+            # Test metrics
+            'Test_Accuracy': test_metrics['accuracy'],
+            'Test_Precision': test_metrics['precision'],
+            'Test_Recall': test_metrics['recall'],
+            'Test_F1_Score': test_metrics['f1_score'],
+            'Test_MCC': test_metrics['mcc'],
+            'Test_AUC': test_metrics.get('auc', np.nan),
+        }
+        
+        # Add confusion matrix values for binary classification
+        if BINARY_CLASSIFICATION:
+            result.update({
+                'Val_TN': val_metrics.get('tn', np.nan),
+                'Val_FP': val_metrics.get('fp', np.nan),
+                'Val_FN': val_metrics.get('fn', np.nan),
+                'Val_TP': val_metrics.get('tp', np.nan),
+                'Val_Specificity': val_metrics.get('specificity', np.nan),
+                'Val_Sensitivity': val_metrics.get('sensitivity', np.nan),
+                
+                'Test_TN': test_metrics.get('tn', np.nan),
+                'Test_FP': test_metrics.get('fp', np.nan),
+                'Test_FN': test_metrics.get('fn', np.nan),
+                'Test_TP': test_metrics.get('tp', np.nan),
+                'Test_Specificity': test_metrics.get('specificity', np.nan),
+                'Test_Sensitivity': test_metrics.get('sensitivity', np.nan),
+            })
+        
+        all_results.append(result)
+        trained_models[model_name] = model
+        
+        print(f"\n✓ {model_name} complete!")
+        
+    except Exception as e:
+        print(f"\n✗ Error training {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print(f"\n{'='*80}")
+print(f"✓ Training Complete: {len(all_results)}/{len(models_config)} models")
+print(f"{'='*80}")
+
+
+# =================================================================================
+# STEP 19: SAVE COMPREHENSIVE RESULTS TO CSV
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 19: Saving Comprehensive Results")
+print("="*80)
+
+# Create comprehensive results DataFrame
+results_df = pd.DataFrame(all_results)
+results_df = results_df.sort_values('Test_F1_Score', ascending=False).reset_index(drop=True)
+
+# Save main results
+main_results_path = os.path.join(OUTPUT_DIR, 'ALL_MODELS_RESULTS.csv')
+results_df.to_csv(main_results_path, index=False, float_format='%.6f')
+print(f"✓ Main results saved: {main_results_path}")
+
+# Save validation metrics only
+val_cols = ['Model'] + [col for col in results_df.columns if col.startswith('Val_')]
+val_results_path = os.path.join(OUTPUT_DIR, 'VALIDATION_RESULTS.csv')
+results_df[val_cols].to_csv(val_results_path, index=False, float_format='%.6f')
+print(f"✓ Validation results saved: {val_results_path}")
+
+# Save test metrics only
+test_cols = ['Model'] + [col for col in results_df.columns if col.startswith('Test_')]
+test_results_path = os.path.join(OUTPUT_DIR, 'TEST_RESULTS.csv')
+results_df[test_cols].to_csv(test_results_path, index=False, float_format='%.6f')
+print(f"✓ Test results saved: {test_results_path}")
+
+# Save performance metrics (timing, size)
+perf_cols = ['Model', 'Train_Time_sec', 'Inference_Time_ms', 'Model_Size_MB']
+perf_results_path = os.path.join(OUTPUT_DIR, 'PERFORMANCE_METRICS.csv')
+results_df[perf_cols].to_csv(perf_results_path, index=False, float_format='%.6f')
+print(f"✓ Performance metrics saved: {perf_results_path}")
+
+# Display summary table
+print("\n" + "="*80)
+print("SUMMARY: All Models Performance")
+print("="*80)
+print(results_df[['Model', 'Test_Accuracy', 'Test_Precision', 'Test_Recall', 'Test_F1_Score', 'Test_MCC']].to_string(index=False))
+
+
+# =================================================================================
+# STEP 20: ENHANCED VISUALIZATIONS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 20: Generating Visualizations")
+print("="*80)
+
+# 1. Performance Metrics Comparison (Bar Charts)
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle('Model Performance Comparison - Test Set', fontsize=16, fontweight='bold')
+
+metrics_to_plot = ['Test_Accuracy', 'Test_Precision', 'Test_Recall', 'Test_F1_Score', 'Test_MCC']
+if 'Test_AUC' in results_df.columns and not results_df['Test_AUC'].isna().all():
+    metrics_to_plot.append('Test_AUC')
+
+colors = plt.cm.Set3(range(len(results_df)))
+
+for idx, metric in enumerate(metrics_to_plot):
+    row, col = idx // 3, idx % 3
+    ax = axes[row, col]
+    
+    bars = ax.barh(results_df['Model'], results_df[metric], color=colors)
+    ax.set_xlabel(metric.replace('_', ' '), fontsize=11)
+    ax.set_title(metric.replace('_', ' '), fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    # Add value labels
+    for bar in bars:
+        width = bar.get_width()
+        if not np.isnan(width):
+            ax.text(width, bar.get_y() + bar.get_height()/2, 
+                   f'{width:.4f}', ha='left', va='center', fontsize=9)
+
+# Hide extra subplot if needed
+if len(metrics_to_plot) < 6:
+    axes[1, 2].axis('off')
+
+plt.tight_layout()
+comp_path = os.path.join(FIGURES_DIR, 'performance_comparison.png')
+plt.savefig(comp_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Performance comparison saved: {comp_path}")
+
+
+# 2. Efficiency Comparison (Training & Inference Time)
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+axes[0].barh(results_df['Model'], results_df['Train_Time_sec'], color=colors)
+axes[0].set_xlabel('Training Time (seconds)', fontsize=12)
+axes[0].set_title('Training Time Comparison', fontsize=14, fontweight='bold')
+axes[0].grid(True, alpha=0.3, axis='x')
+for i, (model, time_val) in enumerate(zip(results_df['Model'], results_df['Train_Time_sec'])):
+    axes[0].text(time_val, i, f' {time_val:.2f}s', va='center', fontsize=9)
+
+axes[1].barh(results_df['Model'], results_df['Inference_Time_ms'], color=colors)
+axes[1].set_xlabel('Inference Time (ms per sample)', fontsize=12)
+axes[1].set_title('Inference Time Comparison', fontsize=14, fontweight='bold')
+axes[1].grid(True, alpha=0.3, axis='x')
+for i, (model, time_val) in enumerate(zip(results_df['Model'], results_df['Inference_Time_ms'])):
+    axes[1].text(time_val, i, f' {time_val:.4f}ms', va='center', fontsize=9)
+
+plt.tight_layout()
+eff_path = os.path.join(FIGURES_DIR, 'efficiency_comparison.png')
+plt.savefig(eff_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✓ Efficiency comparison saved: {eff_path}")
+
+
+# 3. Radar Chart for Best 3 Models (Different visualization style)
+if len(results_df) >= 3:
+    from math import pi
+    
+    top_3_models = results_df.head(3)
+    categories = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'MCC']
+    
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+    
+    angles = [n / float(len(categories)) * 2 * pi for n in range(len(categories))]
+    angles += angles[:1]
+    
+    ax.set_theta_offset(pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, size=12)
+    
+    for idx, row in top_3_models.iterrows():
+        values = [
+            row['Test_Accuracy'],
+            row['Test_Precision'],
+            row['Test_Recall'],
+            row['Test_F1_Score'],
+            row['Test_MCC']
+        ]
+        values += values[:1]
+        
+        ax.plot(angles, values, 'o-', linewidth=2, label=row['Model'])
+        ax.fill(angles, values, alpha=0.15)
+    
+    ax.set_ylim(0, 1)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=11)
+    ax.set_title('Top 3 Models - Performance Radar', size=16, fontweight='bold', pad=20)
+    ax.grid(True)
+    
+    plt.tight_layout()
+    radar_path = os.path.join(FIGURES_DIR, 'top3_radar_chart.png')
+    plt.savefig(radar_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Radar chart saved: {radar_path}")
+
+
+# 4. Confusion Matrix Heatmap Comparison (for binary classification)
+if BINARY_CLASSIFICATION and len(results_df) > 0:
+    n_models = len(results_df)
+    fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 5))
+    if n_models == 1:
+        axes = [axes]
+    
+    fig.suptitle('Confusion Matrices - All Models', fontsize=16, fontweight='bold')
+    
+    for idx, (ax, model_name) in enumerate(zip(axes, results_df['Model'])):
+        model = trained_models[model_name]
+        test_pred = model.predict(X_test_final)
+        cm = confusion_matrix(y_test, test_pred)
+        
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True)
+        ax.set_title(model_name, fontsize=12, fontweight='bold')
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_xticklabels(['BENIGN', 'ATTACK'])
+        ax.set_yticklabels(['BENIGN', 'ATTACK'])
+    
+    plt.tight_layout()
+    cm_comp_path = os.path.join(FIGURES_DIR, 'confusion_matrices_all.png')
+    plt.savefig(cm_comp_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Confusion matrix comparison saved: {cm_comp_path}")
+
+
+# =================================================================================
+# STEP 21: BEST MODEL ANALYSIS
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 21: Best Model Analysis")
+print("="*80)
+
+best_model_row = results_df.iloc[0]
+best_model_name = best_model_row['Model']
+best_model = trained_models[best_model_name]
+
+print(f"\n🏆 BEST MODEL: {best_model_name}")
+print("="*80)
+print(f"Test F1-Score:  {best_model_row['Test_F1_Score']:.4f}")
+print(f"Test Accuracy:  {best_model_row['Test_Accuracy']:.4f}")
+print(f"Test Precision: {best_model_row['Test_Precision']:.4f}")
+print(f"Test Recall:    {best_model_row['Test_Recall']:.4f}")
+print(f"Test MCC:       {best_model_row['Test_MCC']:.4f}")
+
+# Feature importance
+if hasattr(best_model, 'feature_importances_'):
+    importances = best_model.feature_importances_
+    feature_importance_df = pd.DataFrame({
+        'Feature': selected_features,
+        'Importance': importances
+    }).sort_values('Importance', ascending=False)
+    
+    # Save feature importance to CSV
+    feat_imp_path = os.path.join(OUTPUT_DIR, f'FEATURE_IMPORTANCE_{best_model_name}.csv')
+    feature_importance_df.to_csv(feat_imp_path, index=False)
+    print(f"\n✓ Feature importance saved: {feat_imp_path}")
+    
+    # Plot top 20 features
+    top_20 = feature_importance_df.head(20)
+    
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(top_20)), top_20['Importance'], color='steelblue')
+    plt.yticks(range(len(top_20)), top_20['Feature'])
+    plt.xlabel('Importance', fontsize=12)
+    plt.title(f'Top 20 Features - {best_model_name}', fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    
+    imp_plot_path = os.path.join(FIGURES_DIR, f'feature_importance_{best_model_name}.png')
+    plt.savefig(imp_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Feature importance plot saved: {imp_plot_path}")
+
+
+# =================================================================================
+# STEP 22: FINAL SUMMARY REPORT
+# =================================================================================
+
+print("\n" + "="*80)
+print("STEP 22: Final Summary Report")
+print("="*80)
+
+# Create detailed summary report
+summary_report = {
+    'Experiment_Configuration': {
+        'Binary_Classification': BINARY_CLASSIFICATION,
+        'Random_State': RANDOM_STATE,
+        'Training_Samples': len(y_train_resampled),
+        'Validation_Samples': len(y_val),
+        'Test_Samples': len(y_test),
+        'Selected_Features': len(selected_features),
+        'PCA_Used': USE_PCA,
+        'SMOTE_Applied': True,
+        'Total_Models_Trained': len(all_results)
+    },
+    'Best_Model': {
+        'Name': best_model_name,
+        'Test_F1': float(best_model_row['Test_F1_Score']),
+        'Test_Accuracy': float(best_model_row['Test_Accuracy']),
+        'Test_Precision': float(best_model_row['Test_Precision']),
+        'Test_Recall': float(best_model_row['Test_Recall']),
+        'Training_Time_sec': float(best_model_row['Train_Time_sec']),
+        'Inference_Time_ms': float(best_model_row['Inference_Time_ms'])
+    }
+}
+
+# Save summary as JSON
+import json
+summary_json_path = os.path.join(OUTPUT_DIR, 'EXPERIMENT_SUMMARY.json')
+with open(summary_json_path, 'w') as f:
+    json.dump(summary_report, f, indent=2)
+print(f"✓ Experiment summary saved: {summary_json_path}")
+
+# Save summary as text file
+summary_txt_path = os.path.join(OUTPUT_DIR, 'EXPERIMENT_SUMMARY.txt')
+with open(summary_txt_path, 'w') as f:
+    f.write("="*80 + "\n")
+    f.write("CICIDS2017 INTRUSION DETECTION - EXPERIMENT SUMMARY\n")
+    f.write("="*80 + "\n\n")
+    
+    f.write("CONFIGURATION:\n")
+    f.write("-"*80 + "\n")
+    for key, value in summary_report['Experiment_Configuration'].items():
+        f.write(f"{key.replace('_', ' ')}: {value}\n")
+    
+    f.write("\n" + "="*80 + "\n")
+    f.write("BEST MODEL: " + best_model_name + "\n")
+    f.write("="*80 + "\n")
+    for key, value in summary_report['Best_Model'].items():
+        if key != 'Name':
+            f.write(f"{key.replace('_', ' ')}: {value:.6f}\n")
+    
+    f.write("\n" + "="*80 + "\n")
+    f.write("ALL MODELS RANKING (by Test F1-Score):\n")
+    f.write("="*80 + "\n")
+    for idx, row in results_df.iterrows():
+        f.write(f"{idx+1}. {row['Model']}: {row['Test_F1_Score']:.4f}\n")
+
+print(f"✓ Text summary saved: {summary_txt_path}")
+
+
+# =================================================================================
+# FINAL OUTPUT SUMMARY
+# =================================================================================
+
+print("\n" + "="*80)
+print("✓✓✓ ANALYSIS COMPLETE ✓✓✓")
+print("="*80)
+
+print(f"\n📊 Results Summary:")
+print(f"  Total models trained: {len(all_results)}")
+print(f"  Best model: {best_model_name}")
+print(f"  Best F1-Score: {best_model_row['Test_F1_Score']:.4f}")
+print(f"  Best Accuracy: {best_model_row['Test_Accuracy']:.4f}")
+
+print(f"\n📁 Output Files (CSV):")
+print(f"  1. {main_results_path}")
+print(f"  2. {val_results_path}")
+print(f"  3. {test_results_path}")
+print(f"  4. {perf_results_path}")
+if hasattr(best_model, 'feature_importances_'):
+    print(f"  5. {feat_imp_path}")
+
+print(f"\n📈 Visualizations:")
+print(f"  1. Performance comparison (bar charts)")
+print(f"  2. Efficiency comparison (training/inference)")
+print(f"  3. Top 3 models radar chart")
+if BINARY_CLASSIFICATION:
+    print(f"  4. Confusion matrices comparison")
+    print(f"  5. Individual ROC curves")
+if hasattr(best_model, 'feature_importances_'):
+    print(f"  6. Feature importance plot")
+
+print(f"\n📂 All files saved in:")
+print(f"  Models & Results: {OUTPUT_DIR}")
+print(f"  Figures: {FIGURES_DIR}")
+
+print("\n✓ All tasks completed successfully!")
+print("="*80)
+
+
+# In[ ]:
+
+
+
+

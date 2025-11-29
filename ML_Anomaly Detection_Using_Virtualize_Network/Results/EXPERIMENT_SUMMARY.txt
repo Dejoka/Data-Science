@@ -1,0 +1,34 @@
+================================================================================
+CICIDS2017 INTRUSION DETECTION - EXPERIMENT SUMMARY
+================================================================================
+
+CONFIGURATION:
+--------------------------------------------------------------------------------
+Binary Classification: True
+Random State: 42
+Training Samples: 130426
+Validation Samples: 17073
+Test Samples: 17074
+Selected Features: 40
+PCA Used: False
+SMOTE Applied: True
+Total Models Trained: 5
+
+================================================================================
+BEST MODEL: Random_Forest
+================================================================================
+Test F1: 0.994834
+Test Accuracy: 0.998126
+Test Precision: 0.995477
+Test Recall: 0.994192
+Training Time sec: 32.517975
+Inference Time ms: 0.014004
+
+================================================================================
+ALL MODELS RANKING (by Test F1-Score):
+================================================================================
+1. Random_Forest: 0.9948
+2. Gradient_Boosting: 0.9940
+3. Decision_Tree: 0.9940
+4. KNN: 0.9830
+5. ANN_MLP: 0.9537
