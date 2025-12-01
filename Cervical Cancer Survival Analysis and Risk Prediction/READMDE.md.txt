@@ -1,0 +1,19 @@
+A comprehensive machine learning framework for predicting survival outcomes and assessing risk levels in cervical cancer patients using multiple algorithms.
+
+Overview
+
+This project implements 5 machine learning models (Random Survival Forest, SVM, KNN, Neural Networks, Naive Bayes) to predict patient survival and stratify risk into Low, Moderate, and High categories. The analysis identifies key prognostic factors and provides individualized risk assessments.
+
+Key Features
+
+Survival Prediction Models: Multiple ML algorithms with performance comparison
+Risk Stratification: Three-tier risk classification system
+Variable Importance Analysis: Identifies key prognostic factors
+Individual Risk Assessment: Personalized risk scoring for new patients
+Visualizations: Performance plots and importance charts
+
+Dataset
+
+391 patients (274 training, 117 testing)
+21 clinical predictors including FIGO stage, age, treatment, and lifestyle factors
+Outcome variables: Survival time (months) and event status (death/alive)

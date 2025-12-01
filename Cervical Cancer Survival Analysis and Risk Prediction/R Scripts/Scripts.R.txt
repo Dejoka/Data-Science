@@ -1,0 +1,1443 @@
+# Load necessary libraries
+library(survival)
+library(randomForestSRC)
+library(survminer)
+library(pec)
+library(riskRegression)
+library(caTools)
+library(ggplot2)
+library(dplyr)
+library(prodlim)
+library(party)
+library(e1071)
+library(survivalsvm)
+library(survivalROC)
+library(ipred)
+library(nnet)
+library(rpart)
+library(randomForest)
+library(gbm)
+library(pROC)
+
+# Alternative libraries if main ones are not available
+tryCatch({
+  library(survivalsvm)
+}, error = function(e) {
+  print("Warning: survivalsvm not available. Will use alternative SVM implementation.")
+})
+
+# Load the dataset
+print("Loading dataset...")
+data <- read.csv(file.choose(), sep = ",", header = TRUE)
+
+# Data Preprocessing
+print("Starting data preprocessing...")
+
+# Handle missing values
+data <- na.omit(data)
+print(paste("Dataset size after removing missing values:", nrow(data), "rows"))
+
+# Remove Types.of.comorbidity as requested (if it exists)
+if("Types.of.comorbidity" %in% names(data)) {
+  data$Types.of.comorbidity <- NULL
+  print("Removed Types.of.comorbidity column")
+}
+
+# Convert character columns to factors
+char_cols <- sapply(data, is.character)
+if(any(char_cols)) {
+  char_col_names <- names(data)[char_cols]
+  print(paste("Converting character columns to factors:", paste(char_col_names, collapse = ", ")))
+  data[char_col_names] <- lapply(data[char_col_names], as.factor)
+}
+
+# Convert specified categorical variables to factors
+categorical_vars <- c("Marital.status", "Religion", "Occupation", "Tribe", "Histology",
+                     "Tumor.grade", "Treatment.taken", "Commorbidity",
+                     "Reccurence", "Family.history", "Smoking.status", "Alcohol.consumption")
+
+# Only convert variables that exist in the dataset
+existing_categorical_vars <- categorical_vars[categorical_vars %in% names(data)]
+if(length(existing_categorical_vars) > 0) {
+  data[existing_categorical_vars] <- lapply(data[existing_categorical_vars], as.factor)
+  print(paste("Converted to factors:", paste(existing_categorical_vars, collapse = ", ")))
+}
+
+# Print data structure to verify
+print("Data structure after preprocessing:")
+str(data)
+
+# Create survival object
+surv_obj <- Surv(data$Survival_time, data$Death..1..Alive..0.)
+
+# Split data into training and testing sets (70/30 split)
+set.seed(123)
+train_index <- sample.split(data$Death..1..Alive..0., SplitRatio = 0.7)
+train_data <- data[train_index, ]
+test_data <- data[!train_index, ]
+
+# Create survival objects for train and test sets
+train_surv <- Surv(train_data$Survival_time, train_data$Death..1..Alive..0.)
+test_surv <- Surv(test_data$Survival_time, test_data$Death..1..Alive..0.)
+
+# Define predictor variables
+predictors <- setdiff(names(data), c("Death..1..Alive..0.", "Survival_time", "Types.of.comorbidity"))
+print(paste("Number of predictors:", length(predictors)))
+
+# Create formula for survival analysis
+surv_formula <- as.formula(paste("Surv(Survival_time, Death..1..Alive..0.) ~",
+                                paste(predictors, collapse = " + ")))
+
+print(paste("Training set size:", nrow(train_data)))
+print(paste("Test set size:", nrow(test_data)))
+
+# Initialize results storage - separate for train and test
+model_results <- list()
+train_predictions <- list()
+test_predictions <- list()
+
+# ========================================
+# RANDOM SURVIVAL FOREST
+# ========================================
+print("=== FITTING RANDOM SURVIVAL FOREST ===")
+tryCatch({
+  rsf_model <- rfsrc(surv_formula, data = train_data,
+                    ntree = 500, importance = TRUE, seed = 123)
+  
+  # Training predictions
+  rsf_train_pred <- predict(rsf_model, newdata = train_data)
+  train_predictions$RSF <- rsf_train_pred$predicted
+  
+  # Testing predictions
+  rsf_test_pred <- predict(rsf_model, newdata = test_data)
+  test_predictions$RSF <- rsf_test_pred$predicted
+  
+  # Variable importance
+  rsf_importance <- data.frame(
+    Variable = names(rsf_model$importance),
+    Importance = as.numeric(rsf_model$importance)
+  )
+  rsf_importance <- rsf_importance[order(-rsf_importance$Importance), ]
+  
+  model_results$RSF <- list(model = rsf_model, importance = rsf_importance)
+  print("Random Survival Forest fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in RSF:", e$message))
+  model_results$RSF <- NULL
+})
+
+# ========================================
+# SURVIVAL SUPPORT VECTOR MACHINES
+# ========================================
+print("=== FITTING SURVIVAL SUPPORT VECTOR MACHINES ===")
+tryCatch({
+  # Prepare data for SVM
+  train_data_svm <- train_data
+  test_data_svm <- test_data
+  
+  # Convert factors to numeric for SVM
+  factor_cols <- sapply(train_data_svm, is.factor)
+  if(any(factor_cols)) {
+    train_data_svm[factor_cols] <- lapply(train_data_svm[factor_cols], as.numeric)
+    test_data_svm[factor_cols] <- lapply(test_data_svm[factor_cols], as.numeric)
+  }
+  
+  # Try survivalsvm package first
+  if(require(survivalsvm, quietly = TRUE)) {
+    svm_model <- survivalsvm(surv_formula, data = train_data_svm,
+                            gamma.mu = 1, type = "regression")
+    svm_train_pred <- predict(svm_model, newdata = train_data_svm)
+    svm_test_pred <- predict(svm_model, newdata = test_data_svm)
+    train_predictions$SVM <- svm_train_pred$predicted
+    test_predictions$SVM <- svm_test_pred$predicted
+  } else {
+    # Alternative: use regular SVM with survival times as response
+    svm_model <- svm(Survival_time ~ ., data = train_data_svm[, c(predictors, "Survival_time")],
+                    kernel = "radial", cost = 1, gamma = 0.1)
+    svm_train_pred <- predict(svm_model, newdata = train_data_svm)
+    svm_test_pred <- predict(svm_model, newdata = test_data_svm)
+    train_predictions$SVM <- svm_train_pred
+    test_predictions$SVM <- svm_test_pred
+  }
+  
+  model_results$SVM <- list(model = svm_model)
+  print("Survival SVM fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in SVM:", e$message))
+  model_results$SVM <- NULL
+})
+
+# ========================================
+# K-NEAREST NEIGHBORS
+# ========================================
+print("=== FITTING K-NEAREST NEIGHBORS ===")
+tryCatch({
+  # Implement survival KNN using distance-based approach
+  knn_survival_predict <- function(train_data, pred_data, k = 5) {
+    # Convert factors to numeric for distance calculation
+    train_numeric <- train_data
+    pred_numeric <- pred_data
+    
+    factor_cols <- sapply(train_numeric, is.factor)
+    if(any(factor_cols)) {
+      train_numeric[factor_cols] <- lapply(train_numeric[factor_cols], as.numeric)
+      pred_numeric[factor_cols] <- lapply(pred_numeric[factor_cols], as.numeric)
+    }
+    
+    # Extract predictor variables
+    train_predictors <- as.matrix(train_numeric[, predictors])
+    pred_predictors <- as.matrix(pred_numeric[, predictors])
+    
+    # Standardize predictors
+    train_scaled <- scale(train_predictors)
+    pred_scaled <- scale(pred_predictors, center = attr(train_scaled, "scaled:center"),
+                        scale = attr(train_scaled, "scaled:scale"))
+    
+    # Calculate predictions for each observation
+    predictions <- numeric(nrow(pred_scaled))
+    
+    for(i in 1:nrow(pred_scaled)) {
+      # Calculate distances
+      distances <- apply(train_scaled, 1, function(x) sum((x - pred_scaled[i,])^2))
+      
+      # Find k nearest neighbors
+      nearest_idx <- order(distances)[1:k]
+      
+      # Predict based on nearest neighbors (weighted by inverse distance)
+      weights <- 1 / (distances[nearest_idx] + 1e-10)
+      predictions[i] <- weighted.mean(train_data$Survival_time[nearest_idx], weights)
+    }
+    
+    return(predictions)
+  }
+  
+  # Training predictions
+  knn_train_pred <- knn_survival_predict(train_data, train_data, k = 5)
+  train_predictions$KNN <- knn_train_pred
+  
+  # Testing predictions
+  knn_test_pred <- knn_survival_predict(train_data, test_data, k = 5)
+  test_predictions$KNN <- knn_test_pred
+  
+  model_results$KNN <- list(method = "KNN", k = 5)
+  print("K-Nearest Neighbors fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in KNN:", e$message))
+  model_results$KNN <- NULL
+})
+
+# ========================================
+# NEURAL NETWORK
+# ========================================
+print("=== FITTING NEURAL NETWORK ===")
+tryCatch({
+  # Prepare data for neural network
+  train_data_nn <- train_data
+  test_data_nn <- test_data
+  
+  # Convert factors to numeric
+  factor_cols <- sapply(train_data_nn, is.factor)
+  if(any(factor_cols)) {
+    train_data_nn[factor_cols] <- lapply(train_data_nn[factor_cols], as.numeric)
+    test_data_nn[factor_cols] <- lapply(test_data_nn[factor_cols], as.numeric)
+  }
+  
+  # Create neural network formula
+  nn_formula <- as.formula(paste("Survival_time ~", paste(predictors, collapse = " + ")))
+  
+  # Fit neural network
+  nn_model <- nnet(nn_formula, data = train_data_nn,
+                  size = 10, decay = 0.1, maxit = 1000, trace = FALSE)
+  
+  # Training predictions
+  nn_train_pred <- predict(nn_model, newdata = train_data_nn)
+  train_predictions$NN <- as.numeric(nn_train_pred)
+  
+  # Testing predictions
+  nn_test_pred <- predict(nn_model, newdata = test_data_nn)
+  test_predictions$NN <- as.numeric(nn_test_pred)
+  
+  model_results$NN <- list(model = nn_model)
+  print("Neural Network fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in Neural Network:", e$message))
+  model_results$NN <- NULL
+})
+
+# ========================================
+# NAIVE BAYES
+# ========================================
+print("=== FITTING NAIVE BAYES ===")
+tryCatch({
+  # Discretize survival times into risk groups based on training data
+  train_data_nb <- train_data
+  test_data_nb <- test_data
+  
+  # Create risk groups based on survival time quartiles from training data
+  time_breaks <- quantile(train_data_nb$Survival_time, probs = c(0, 0.25, 0.5, 0.75, 1))
+  train_data_nb$risk_group <- cut(train_data_nb$Survival_time, breaks = time_breaks,
+                                  labels = c("High", "Medium-High", "Medium-Low", "Low"))
+  
+  # Create formula for Naive Bayes
+  nb_formula <- as.formula(paste("risk_group ~", paste(predictors, collapse = " + ")))
+  
+  # Fit Naive Bayes model
+  nb_model <- naiveBayes(nb_formula, data = train_data_nb)
+  
+  # Training predictions
+  nb_train_prob <- predict(nb_model, newdata = train_data_nb, type = "raw")
+  group_means <- aggregate(Survival_time ~ risk_group, data = train_data_nb, mean)
+  nb_train_pred <- apply(nb_train_prob, 1, function(x) {
+    weighted.mean(group_means$Survival_time, x)
+  })
+  train_predictions$NB <- nb_train_pred
+  
+  # Testing predictions
+  nb_test_prob <- predict(nb_model, newdata = test_data_nb, type = "raw")
+  nb_test_pred <- apply(nb_test_prob, 1, function(x) {
+    weighted.mean(group_means$Survival_time, x)
+  })
+  test_predictions$NB <- nb_test_pred
+  
+  model_results$NB <- list(model = nb_model, risk_groups = group_means)
+  print("Naive Bayes fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in Naive Bayes:", e$message))
+  model_results$NB <- NULL
+})
+
+# ========================================
+# PERFORMANCE METRICS CALCULATION
+# ========================================
+
+# Enhanced C-index calculation
+calculate_cindex <- function(predicted_risk, survival_time, event_indicator) {
+  if(length(predicted_risk) != length(survival_time) ||
+     length(predicted_risk) != length(event_indicator)) {
+    stop("All inputs must have the same length")
+  }
+  
+  concordant <- 0
+  discordant <- 0
+  comparable_pairs <- 0
+  
+  n <- length(survival_time)
+  
+  for(i in 1:(n-1)) {
+    for(j in (i+1):n) {
+      if(event_indicator[i] == 1 || event_indicator[j] == 1) {
+        comparable_pairs <- comparable_pairs + 1
+        
+        if(survival_time[i] < survival_time[j]) {
+          if(predicted_risk[i] > predicted_risk[j]) concordant <- concordant + 1
+          else if(predicted_risk[i] < predicted_risk[j]) discordant <- discordant + 1
+        } else if(survival_time[i] > survival_time[j]) {
+          if(predicted_risk[i] < predicted_risk[j]) concordant <- concordant + 1
+          else if(predicted_risk[i] > predicted_risk[j]) discordant <- discordant + 1
+        }
+      }
+    }
+  }
+  
+  if((concordant + discordant) == 0) {
+    return(NA)
+  }
+  
+  return(concordant / (concordant + discordant))
+}
+
+# Brier Score calculation
+calculate_brier_score <- function(predicted_prob, actual_event, time_point) {
+  if(length(predicted_prob) != length(actual_event)) {
+    return(NA)
+  }
+  brier_score <- mean((predicted_prob - actual_event)^2)
+  return(brier_score)
+}
+
+# Integrated Absolute Error
+calculate_iae <- function(predicted_time, actual_time) {
+  return(mean(abs(predicted_time - actual_time)))
+}
+
+# Integrated Square Error
+calculate_ise <- function(predicted_time, actual_time) {
+  return(mean((predicted_time - actual_time)^2))
+}
+
+print("=== CALCULATING PERFORMANCE METRICS SEPARATELY ===")
+
+# Function to calculate all metrics for a dataset
+calculate_metrics <- function(predictions, survival_obj, dataset_name) {
+  metrics_df <- data.frame(
+    Model = character(),
+    Dataset = character(),
+    C_index = numeric(),
+    Brier_Score = numeric(),
+    IAE = numeric(),
+    ISE = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(model_name in names(predictions)) {
+    cat(paste("Calculating", dataset_name, "metrics for", model_name, "...\n"))
+    
+    tryCatch({
+      pred_values <- predictions[[model_name]]
+      
+      # Check if predictions are valid
+      if(length(pred_values) == 0 || all(is.na(pred_values))) {
+        cat(paste("Warning: No valid predictions for", model_name, "in", dataset_name, "\n"))
+        next
+      }
+      
+      # C-index (higher is better)
+      c_index <- calculate_cindex(pred_values, survival_obj[,1], survival_obj[,2])
+      
+      # Brier Score (lower is better)
+      if(!all(is.na(pred_values)) && sd(pred_values, na.rm = TRUE) > 0) {
+        pred_prob <- pnorm(pred_values, mean = mean(pred_values, na.rm = TRUE),
+                          sd = sd(pred_values, na.rm = TRUE))
+        brier_score <- calculate_brier_score(pred_prob, survival_obj[,2], median(survival_obj[,1]))
+      } else {
+        brier_score <- NA
+      }
+      
+      # Integrated Absolute Error (lower is better)
+      iae <- calculate_iae(pred_values, survival_obj[,1])
+      
+      # Integrated Square Error (lower is better)
+      ise <- calculate_ise(pred_values, survival_obj[,1])
+      
+      # Add to metrics dataframe
+      metrics_df <- rbind(metrics_df,
+                         data.frame(Model = model_name,
+                                   Dataset = dataset_name,
+                                   C_index = c_index,
+                                   Brier_Score = brier_score,
+                                   IAE = iae,
+                                   ISE = ise,
+                                   stringsAsFactors = FALSE))
+      
+      cat(paste("Completed", dataset_name, "metrics for", model_name, "\n"))
+      
+    }, error = function(e) {
+      cat(paste("Error calculating", dataset_name, "metrics for", model_name, ":", e$message, "\n"))
+    })
+  }
+  
+  return(metrics_df)
+}
+
+# Calculate metrics for training data
+train_metrics <- calculate_metrics(train_predictions, train_surv, "Training")
+
+# Calculate metrics for testing data
+test_metrics <- calculate_metrics(test_predictions, test_surv, "Testing")
+
+# Combine results
+all_metrics <- rbind(train_metrics, test_metrics)
+
+# Display results separately
+cat("\n=== TRAINING DATA PERFORMANCE ===\n")
+if(nrow(train_metrics) > 0) {
+  train_metrics_display <- train_metrics[, -2] # Remove Dataset column for display
+  print(train_metrics_display)
+} else {
+  cat("No training metrics available.\n")
+}
+
+cat("\n=== TESTING DATA PERFORMANCE ===\n")
+if(nrow(test_metrics) > 0) {
+  test_metrics_display <- test_metrics[, -2] # Remove Dataset column for display
+  print(test_metrics_display)
+} else {
+  cat("No testing metrics available.\n")
+}
+
+# ========================================
+# OVERFITTING ANALYSIS
+# ========================================
+print("=== OVERFITTING ANALYSIS ===")
+if(nrow(train_metrics) > 0 && nrow(test_metrics) > 0) {
+  # Merge train and test metrics for comparison
+  overfitting_analysis <- merge(train_metrics[, c("Model", "C_index", "IAE", "ISE")],
+                               test_metrics[, c("Model", "C_index", "IAE", "ISE")],
+                               by = "Model", suffixes = c("_Train", "_Test"))
+  
+  # Calculate differences (positive values indicate overfitting)
+  overfitting_analysis$C_index_Diff <- overfitting_analysis$C_index_Train - overfitting_analysis$C_index_Test
+  overfitting_analysis$IAE_Diff <- overfitting_analysis$IAE_Test - overfitting_analysis$IAE_Train
+  overfitting_analysis$ISE_Diff <- overfitting_analysis$ISE_Test - overfitting_analysis$ISE_Train
+  
+  # Add overfitting indicator
+  overfitting_analysis$Overfitting_Risk <- ifelse(
+    overfitting_analysis$C_index_Diff > 0.05 |
+    overfitting_analysis$IAE_Diff > 10 |
+    overfitting_analysis$ISE_Diff > 100,
+    "High", "Low")
+  
+  cat("\nOverfitting Analysis:\n")
+  cat("(Positive C_index_Diff indicates lower test performance)\n")
+  cat("(Positive IAE_Diff and ISE_Diff indicate higher test errors)\n\n")
+  print(overfitting_analysis)
+} else {
+  cat("Insufficient data for overfitting analysis.\n")
+}
+
+# ========================================
+# VISUALIZATIONS
+# ========================================
+print("=== CREATING ENHANCED VISUALIZATIONS ===")
+
+# Plot 1: Training vs Testing Performance Comparison
+if(nrow(all_metrics) > 0 && any(!is.na(all_metrics$C_index))) {
+  # Prepare data for plotting
+  plot_data <- all_metrics[!is.na(all_metrics$C_index), ]
+  
+  if(nrow(plot_data) > 0) {
+    p1 <- ggplot(plot_data, aes(x = Model, y = C_index, fill = Dataset)) +
+      geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+      geom_text(aes(label = round(C_index, 3)),
+               position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+      theme_minimal() +
+      labs(title = "Model Performance Comparison: Training vs Testing (C-index)",
+           x = "Model", y = "C-index") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      scale_fill_manual(values = c("Training" = "lightblue", "Testing" = "lightcoral"))
+    
+    tryCatch({
+      print(p1)
+    }, error = function(e) {
+      cat("Error creating comparison plot:", e$message, "\n")
+    })
+  }
+}
+
+# Plot 2: Error Metrics Comparison
+if(nrow(all_metrics) > 0 && any(!is.na(all_metrics$IAE))) {
+  plot_data_iae <- all_metrics[!is.na(all_metrics$IAE), ]
+  
+  if(nrow(plot_data_iae) > 0) {
+    p2 <- ggplot(plot_data_iae, aes(x = Model, y = IAE, fill = Dataset)) +
+      geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+      geom_text(aes(label = round(IAE, 2)),
+               position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+      theme_minimal() +
+      labs(title = "Integrated Absolute Error: Training vs Testing",
+           x = "Model", y = "IAE (Lower is Better)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      scale_fill_manual(values = c("Training" = "lightgreen", "Testing" = "lightsalmon"))
+    
+    tryCatch({
+      print(p2)
+    }, error = function(e) {
+      cat("Error creating IAE plot:", e$message, "\n")
+    })
+  }
+}
+
+# Plot 3: Variable Importance (if RSF was successful)
+if(!is.null(model_results$RSF) && !is.null(model_results$RSF$importance)) {
+  p3 <- ggplot(head(model_results$RSF$importance, 10),
+              aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top 10 Variables - Random Survival Forest Importance",
+         x = "Variable", y = "Importance")
+  
+  tryCatch({
+    print(p3)
+  }, error = function(e) {
+    cat("Error creating importance plot:", e$message, "\n")
+  })
+}
+
+# ========================================
+# COMPREHENSIVE ANALYSIS SUMMARY
+# ========================================
+cat("=== COMPREHENSIVE ANALYSIS SUMMARY ===\n")
+
+# Best performing models
+if(nrow(train_metrics) > 0 && nrow(test_metrics) > 0) {
+  # Best training model
+  best_train_idx <- which.max(train_metrics$C_index[!is.na(train_metrics$C_index)])
+  if(length(best_train_idx) > 0) {
+    best_train_model <- train_metrics$Model[best_train_idx]
+    best_train_cindex <- train_metrics$C_index[best_train_idx]
+    cat(paste("Best Training Performance:", best_train_model, "with C-index =", round(best_train_cindex, 3), "\n"))
+  }
+  
+  # Best testing model
+  best_test_idx <- which.max(test_metrics$C_index[!is.na(test_metrics$C_index)])
+  if(length(best_test_idx) > 0) {
+    best_test_model <- test_metrics$Model[best_test_idx]
+    best_test_cindex <- test_metrics$C_index[best_test_idx]
+    cat(paste("Best Testing Performance:", best_test_model, "with C-index =", round(best_test_cindex, 3), "\n"))
+  }
+  
+  # Most generalizable model (smallest performance gap)
+  if(exists("overfitting_analysis") && nrow(overfitting_analysis) > 0) {
+    min_gap_idx <- which.min(abs(overfitting_analysis$C_index_Diff))
+    most_generalizable <- overfitting_analysis$Model[min_gap_idx]
+    gap_value <- overfitting_analysis$C_index_Diff[min_gap_idx]
+    cat(paste("Most Generalizable Model:", most_generalizable, "with C-index gap =", round(gap_value, 3), "\n"))
+  }
+}
+
+# Create final comprehensive summary table
+if(nrow(all_metrics) > 0) {
+  # Reshape data for final summary
+  summary_table <- data.frame(
+    Model = unique(all_metrics$Model),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add training metrics
+  train_summary <- train_metrics[, c("Model", "C_index", "IAE", "ISE")]
+  names(train_summary)[2:4] <- paste0(names(train_summary)[2:4], "_Train")
+  summary_table <- merge(summary_table, train_summary, by = "Model", all.x = TRUE)
+  
+  # Add testing metrics
+  test_summary <- test_metrics[, c("Model", "C_index", "IAE", "ISE")]
+  names(test_summary)[2:4] <- paste0(names(test_summary)[2:4], "_Test")
+  summary_table <- merge(summary_table, test_summary, by = "Model", all.x = TRUE)
+  
+  # Round numeric columns
+  numeric_cols <- sapply(summary_table, is.numeric)
+  summary_table[numeric_cols] <- lapply(summary_table[numeric_cols], function(x) round(x, 3))
+  
+  cat("\nFinal Comprehensive Summary:\n")
+  print(summary_table)
+}
+
+# Model recommendations
+cat("\n=== MODEL RECOMMENDATIONS ===\n")
+cat("1. For highest predictive accuracy: Use the model with highest test C-index\n")
+cat("2. For clinical deployment: Choose the most generalizable model (smallest train-test gap)\n")
+cat("3. For interpretability: Random Survival Forest provides variable importance\n")
+cat("4. Consider ensemble methods combining top 2-3 models for robust predictions\n")
+
+print("=== ENHANCED ANALYSIS COMPLETED ===")
+
+# ========================================
+# RISK FACTOR PREDICTION ANALYSIS
+# ========================================
+print("=== RISK FACTOR PREDICTION ANALYSIS ===")
+
+# Define risk categories based on survival time and event status
+create_risk_categories <- function(survival_time, event_status) {
+  # Create risk score based on survival time and event occurrence
+  risk_score <- ifelse(event_status == 1,
+                      1 / (survival_time + 1), # Higher risk for shorter survival with event
+                      1 / (survival_time + 100)) # Lower risk for longer survival without event
+  
+  # Categorize into risk levels
+  risk_breaks <- quantile(risk_score, probs = c(0, 0.33, 0.66, 1))
+  risk_categories <- cut(risk_score, breaks = risk_breaks,
+                        labels = c("Low", "Moderate", "High"),
+                        include.lowest = TRUE)
+  
+  return(list(risk_score = risk_score, risk_categories = risk_categories))
+}
+
+# Create risk categories for training and testing data
+train_risk <- create_risk_categories(train_data$Survival_time, train_data$Death..1..Alive..0.)
+test_risk <- create_risk_categories(test_data$Survival_time, test_data$Death..1..Alive..0.)
+
+train_data$risk_score <- train_risk$risk_score
+train_data$risk_category <- train_risk$risk_categories
+test_data$risk_score <- test_risk$risk_score
+test_data$risk_category <- test_risk$risk_categories
+
+print("Risk categories created:")
+print(table(train_data$risk_category))
+
+# Initialize storage for risk prediction models
+risk_models <- list()
+risk_predictions <- list()
+
+# ========================================
+# RANDOM FOREST FOR RISK CLASSIFICATION
+# ========================================
+print("=== FITTING RANDOM FOREST FOR RISK CLASSIFICATION ===")
+tryCatch({
+  library(randomForest)
+  
+  # Create formula for risk prediction
+  risk_formula <- as.formula(paste("risk_category ~", paste(predictors, collapse = " + ")))
+  
+  # Fit random forest model
+  rf_risk_model <- randomForest(risk_formula, data = train_data,
+                                ntree = 500, importance = TRUE,
+                                na.action = na.omit)
+  
+  # Training predictions
+  rf_train_pred <- predict(rf_risk_model, newdata = train_data, type = "prob")
+  rf_train_class <- predict(rf_risk_model, newdata = train_data)
+  
+  # Testing predictions
+  rf_test_pred <- predict(rf_risk_model, newdata = test_data, type = "prob")
+  rf_test_class <- predict(rf_risk_model, newdata = test_data)
+  
+  # Variable importance
+  rf_importance <- importance(rf_risk_model)
+  rf_importance_df <- data.frame(
+    Variable = rownames(rf_importance),
+    MeanDecreaseAccuracy = rf_importance[, "MeanDecreaseAccuracy"],
+    MeanDecreaseGini = rf_importance[, "MeanDecreaseGini"]
+  )
+  rf_importance_df <- rf_importance
+  rf_importance_df <- rf_importance_df[order(-rf_importance_df$MeanDecreaseGini), ]
+  
+  risk_models$RF <- list(model = rf_risk_model, importance = rf_importance_df)
+  risk_predictions$RF <- list(train_prob = rf_train_pred, train_class = rf_train_class,
+                              test_prob = rf_test_pred, test_class = rf_test_class)
+  
+  print("Random Forest for risk classification fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in Random Forest risk classification:", e$message))
+})
+
+# ========================================
+# SVM FOR RISK CLASSIFICATION
+# ========================================
+print("=== FITTING SVM FOR RISK CLASSIFICATION ===")
+tryCatch({
+  # Prepare data for SVM (convert factors to numeric)
+  train_data_svm_risk <- train_data
+  test_data_svm_risk <- test_data
+  
+  # Convert factors to numeric for SVM
+  factor_cols <- sapply(train_data_svm_risk[, predictors], is.factor)
+  if(any(factor_cols)) {
+    factor_predictors <- predictors[factor_cols]
+    train_data_svm_risk[factor_predictors] <- lapply(train_data_svm_risk[factor_predictors], as.numeric)
+    test_data_svm_risk[factor_predictors] <- lapply(test_data_svm_risk[factor_predictors], as.numeric)
+  }
+  
+  # Fit SVM model
+  svm_risk_model <- svm(risk_category ~ .,
+                       data = train_data_svm_risk[, c(predictors, "risk_category")],
+                       kernel = "radial", cost = 1, gamma = 0.1, probability = TRUE)
+  
+  # Training predictions
+  svm_train_pred <- predict(svm_risk_model, newdata = train_data_svm_risk, probability = TRUE)
+  svm_train_prob <- attr(svm_train_pred, "probabilities")
+  
+  # Testing predictions
+  svm_test_pred <- predict(svm_risk_model, newdata = test_data_svm_risk, probability = TRUE)
+  svm_test_prob <- attr(svm_test_pred, "probabilities")
+  
+  risk_models$SVM <- list(model = svm_risk_model)
+  risk_predictions$SVM <- list(train_prob = svm_train_prob, train_class = svm_train_pred,
+                               test_prob = svm_test_prob, test_class = svm_test_pred)
+  
+  print("SVM for risk classification fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in SVM risk classification:", e$message))
+})
+
+# ========================================
+# GRADIENT BOOSTING FOR RISK CLASSIFICATION
+# ========================================
+print("=== FITTING GRADIENT BOOSTING FOR RISK CLASSIFICATION ===")
+tryCatch({
+  library(gbm)
+  
+  # Convert risk categories to numeric for GBM
+  train_data_gbm <- train_data
+  test_data_gbm <- test_data
+  
+  # Convert risk category to numeric (0, 1, 2)
+  train_data_gbm$risk_numeric <- as.numeric(train_data_gbm$risk_category) - 1
+  test_data_gbm$risk_numeric <- as.numeric(test_data_gbm$risk_category) - 1
+  
+  # Fit GBM model
+  gbm_risk_model <- gbm(risk_numeric ~ .,
+                       data = train_data_gbm[, c(predictors, "risk_numeric")],
+                       distribution = "multinomial",
+                       n.trees = 500,
+                       interaction.depth = 4,
+                       shrinkage = 0.01,
+                       cv.folds = 5,
+                       verbose = FALSE)
+  
+  # Find optimal number of trees
+  optimal_trees <- gbm.perf(gbm_risk_model, method = "cv", plot.it = FALSE)
+  
+  # Training predictions
+  gbm_train_pred <- predict(gbm_risk_model, newdata = train_data_gbm,
+                           n.trees = optimal_trees, type = "response")
+  gbm_train_class <- apply(gbm_train_pred, 1, which.max)
+  
+  # Testing predictions
+  gbm_test_pred <- predict(gbm_risk_model, newdata = test_data_gbm,
+                          n.trees = optimal_trees, type = "response")
+  gbm_test_class <- apply(gbm_test_pred, 1, which.max)
+  
+  # Variable importance
+  gbm_importance <- summary(gbm_risk_model, n.trees = optimal_trees, plotit = FALSE)
+  
+  risk_models$GBM <- list(model = gbm_risk_model, importance = gbm_importance,
+                         optimal_trees = optimal_trees)
+  risk_predictions$GBM <- list(train_prob = gbm_train_pred, train_class = gbm_train_class,
+                               test_prob = gbm_test_pred, test_class = gbm_test_class)
+  
+  print("Gradient Boosting for risk classification fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in Gradient Boosting risk classification:", e$message))
+})
+
+# ========================================
+# LOGISTIC REGRESSION FOR BINARY RISK
+# ========================================
+print("=== FITTING LOGISTIC REGRESSION FOR BINARY RISK ===")
+tryCatch({
+  # Create binary risk (High vs Low+Moderate)
+  train_data$binary_risk <- ifelse(train_data$risk_category == "High", 1, 0)
+  test_data$binary_risk <- ifelse(test_data$risk_category == "High", 1, 0)
+  
+  # Create formula for logistic regression
+  logit_formula <- as.formula(paste("binary_risk ~", paste(predictors, collapse = " + ")))
+  
+  # Fit logistic regression model
+  logit_risk_model <- glm(logit_formula, data = train_data, family = binomial())
+  
+  # Training predictions
+  logit_train_prob <- predict(logit_risk_model, newdata = train_data, type = "response")
+  logit_train_class <- ifelse(logit_train_prob > 0.5, 1, 0)
+  
+  # Testing predictions
+  logit_test_prob <- predict(logit_risk_model, newdata = test_data, type = "response")
+  logit_test_class <- ifelse(logit_test_prob > 0.5, 1, 0)
+  
+  risk_models$Logistic <- list(model = logit_risk_model)
+  risk_predictions$Logistic <- list(train_prob = logit_train_prob, train_class = logit_train_class,
+                                    test_prob = logit_test_prob, test_class = logit_test_class)
+  
+  print("Logistic Regression for binary risk classification fitted successfully!")
+  
+}, error = function(e) {
+  print(paste("Error in Logistic Regression risk classification:", e$message))
+})
+
+# ========================================
+# EVALUATING RISK PREDICTION PERFORMANCE
+# ========================================
+print("=== EVALUATING RISK PREDICTION PERFORMANCE ===")
+
+# Function to calculate classification metrics
+calculate_classification_metrics <- function(predicted_class, actual_class, predicted_prob = NULL) {
+  # Convert factors to same levels if needed
+  if(is.factor(predicted_class) && is.factor(actual_class)) {
+    levels(predicted_class) <- levels(actual_class)
+  }
+  
+  # Confusion matrix
+  cm <- table(Predicted = predicted_class, Actual = actual_class)
+  
+  # Calculate metrics
+  accuracy <- sum(diag(cm)) / sum(cm)
+  
+  # For binary classification
+  if(length(unique(actual_class)) == 2) {
+    if(nrow(cm) == 2 && ncol(cm) == 2) {
+      precision <- cm[2,2] / sum(cm[2,])
+      recall <- cm[2,2] / sum(cm[,2])
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+      
+      # AUC if probabilities are provided
+      auc <- NA
+      if(!is.null(predicted_prob)) {
+        library(pROC)
+        roc_obj <- roc(actual_class, predicted_prob, quiet = TRUE)
+        auc <- auc(roc_obj)
+      }
+    } else {
+      precision <- recall <- f1_score <- auc <- NA
+    }
+  } else {
+    # Multi-class metrics
+    precision <- recall <- f1_score <- auc <- NA
+  }
+  
+  return(list(
+    confusion_matrix = cm,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1_score = f1_score,
+    auc = auc
+  ))
+}
+
+# Evaluate each model
+risk_performance <- list()
+for(model_name in names(risk_predictions)) {
+  cat(paste("Evaluating", model_name, "...\n"))
+  
+  tryCatch({
+    # Training performance
+    if(model_name == "Logistic") {
+      train_metrics <- calculate_classification_metrics(
+        risk_predictions[[model_name]]$train_class,
+        train_data$binary_risk,
+        risk_predictions[[model_name]]$train_prob
+      )
+      test_metrics <- calculate_classification_metrics(
+        risk_predictions[[model_name]]$test_class,
+        test_data$binary_risk,
+        risk_predictions[[model_name]]$test_prob
+      )
+    } else {
+      train_metrics <- calculate_classification_metrics(
+        risk_predictions[[model_name]]$train_class,
+        train_data$risk_category
+      )
+      test_metrics <- calculate_classification_metrics(
+        risk_predictions[[model_name]]$test_class,
+        test_data$risk_category
+      )
+    }
+    
+    risk_performance[[model_name]] <- list(
+      train = train_metrics,
+      test = test_metrics
+    )
+    
+  }, error = function(e) {
+    cat(paste("Error evaluating", model_name, ":", e$message, "\n"))
+  })
+}
+
+# ========================================
+# IDENTIFYING KEY RISK FACTORS
+# ========================================
+print("=== IDENTIFYING KEY RISK FACTORS ===")
+
+# Combine variable importance from different models
+all_importance <- list()
+
+# Random Forest importance
+if(!is.null(risk_models$RF$importance)) {
+  rf_imp <- risk_models$RF$importance[, c("Variable", "MeanDecreaseGini")]
+  rf_imp$Model <- "Random Forest"
+  rf_imp$Importance <- rf_imp$MeanDecreaseGini
+  all_importance$RF <- rf_imp[, c("Variable", "Importance", "Model")]
+}
+
+# GBM importance
+if(!is.null(risk_models$GBM$importance)) {
+  gbm_imp <- risk_models$GBM$importance[, c("var", "rel.inf")]
+  names(gbm_imp) <- c("Variable", "Importance")
+  gbm_imp$Model <- "Gradient Boosting"
+  all_importance$GBM <- gbm_imp
+}
+
+# Logistic Regression coefficients
+if(!is.null(risk_models$Logistic$model)) {
+  logit_coef <- summary(risk_models$Logistic$model)$coefficients
+  logit_imp <- data.frame(
+    Variable = rownames(logit_coef)[-1], # Exclude intercept
+    Importance = abs(logit_coef[-1, "z value"]), # Use absolute z-values
+    Model = "Logistic Regression"
+  )
+  all_importance$Logistic <- logit_imp
+}
+
+# Combine all importance measures
+if(length(all_importance) > 0) {
+  combined_importance <- do.call(rbind, all_importance)
+  
+  # Calculate average importance across models
+  avg_importance <- aggregate(Importance ~ Variable, data = combined_importance, mean)
+  avg_importance <- avg_importance[order(-avg_importance$Importance), ]
+  
+  print("Top 10 Risk Factors (Average Importance):")
+  print(head(avg_importance, 10))
+}
+
+# ========================================
+# CALCULATING COMPOSITE RISK SCORES
+# ========================================
+print("=== CALCULATING COMPOSITE RISK SCORES ===")
+
+# Function to calculate composite risk score
+calculate_composite_risk <- function(data, models, weights = NULL) {
+  if(is.null(weights)) {
+    weights <- rep(1/length(models), length(models))
+  }
+  
+  composite_scores <- rep(0, nrow(data))
+  
+  for(i in seq_along(models)) {
+    model_name <- names(models)[i]
+    if(model_name %in% names(risk_predictions)) {
+      if(model_name == "Logistic") {
+        # For logistic regression, use probability directly
+        if("test_prob" %in% names(risk_predictions[[model_name]])) {
+          scores <- risk_predictions[[model_name]]$test_prob
+        } else {
+          scores <- rep(0, nrow(data))
+        }
+      } else {
+        # For multi-class models, use high-risk probability
+        if("test_prob" %in% names(risk_predictions[[model_name]])) {
+          probs <- risk_predictions[[model_name]]$test_prob
+          if(is.matrix(probs) && ncol(probs) >= 3) {
+            scores <- probs[, 3] # High risk probability
+          } else {
+            scores <- rep(0, nrow(data))
+          }
+        } else {
+          scores <- rep(0, nrow(data))
+        }
+      }
+      composite_scores <- composite_scores + weights[i] * scores
+    }
+  }
+  
+  return(composite_scores)
+}
+
+# Calculate composite risk scores for test data
+if(length(risk_models) > 0) {
+  composite_risk_scores <- calculate_composite_risk(test_data, risk_models)
+  
+  # Add to test data
+  test_data$composite_risk_score <- composite_risk_scores
+  
+  # Create risk categories based on composite scores
+  risk_breaks <- quantile(composite_risk_scores, probs = c(0, 0.33, 0.66, 1))
+  test_data$composite_risk_category <- cut(composite_risk_scores,
+                                           breaks = risk_breaks,
+                                           labels = c("Low", "Moderate", "High"),
+                                           include.lowest = TRUE)
+  
+  print("Composite Risk Score Distribution:")
+  print(summary(composite_risk_scores))
+  print(table(test_data$composite_risk_category))
+}
+
+# ========================================
+# CREATING RISK PREDICTION VISUALIZATIONS
+# ========================================
+print("=== CREATING RISK PREDICTION VISUALIZATIONS ===")
+
+# Plot 1: Model Performance Comparison
+if(length(risk_performance) > 0) {
+  # Extract accuracy metrics
+  accuracy_data <- data.frame(
+    Model = character(),
+    Dataset = character(),
+    Accuracy = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(model_name in names(risk_performance)) {
+    if(!is.null(risk_performance[[model_name]]$train$accuracy)) {
+      accuracy_data <- rbind(accuracy_data,
+                            data.frame(Model = model_name,
+                                      Dataset = "Training",
+                                      Accuracy = risk_performance[[model_name]]$train$accuracy))
+    }
+    if(!is.null(risk_performance[[model_name]]$test$accuracy)) {
+      accuracy_data <- rbind(accuracy_data,
+                            data.frame(Model = model_name,
+                                      Dataset = "Testing",
+                                      Accuracy = risk_performance[[model_name]]$test$accuracy))
+    }
+  }
+  
+  # Create accuracy comparison plot
+  if(nrow(accuracy_data) > 0) {
+    p_accuracy <- ggplot(accuracy_data, aes(x = Model, y = Accuracy, fill = Dataset)) +
+      geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+      geom_text(aes(label = round(Accuracy, 3)),
+               position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+      theme_minimal() +
+      labs(title = "Risk Prediction Model Accuracy Comparison",
+           x = "Model", y = "Accuracy") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      scale_fill_manual(values = c("Training" = "lightblue", "Testing" = "lightcoral"))
+    
+    tryCatch({
+      print(p_accuracy)
+    }, error = function(e) {
+      cat("Error creating accuracy plot:", e$message, "\n")
+    })
+  }
+}
+
+# Plot 2: Variable Importance
+if(exists("avg_importance") && nrow(avg_importance) > 0) {
+  p_importance <- ggplot(head(avg_importance, 10),
+                        aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top 10 Risk Factors - Average Importance",
+         x = "Risk Factor", y = "Importance Score")
+  
+  tryCatch({
+    print(p_importance)
+  }, error = function(e) {
+    cat("Error creating importance plot:", e$message, "\n")
+  })
+}
+
+# Plot 3: Risk Score Distribution
+if(exists("composite_risk_scores")) {
+  p_risk_dist <- ggplot(test_data, aes(x = composite_risk_score)) +
+    geom_histogram(bins = 30, fill = "lightblue", alpha = 0.7, color = "black") +
+    geom_vline(xintercept = quantile(composite_risk_scores, c(0.33, 0.66)),
+              color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(title = "Distribution of Composite Risk Scores",
+         x = "Composite Risk Score", y = "Frequency") +
+    annotate("text", x = quantile(composite_risk_scores, 0.16), y = Inf,
+            label = "Low Risk", vjust = 2, color = "green") +
+    annotate("text", x = quantile(composite_risk_scores, 0.5), y = Inf,
+            label = "Moderate Risk", vjust = 2, color = "orange") +
+    annotate("text", x = quantile(composite_risk_scores, 0.83), y = Inf,
+            label = "High Risk", vjust = 2, color = "red")
+  
+  tryCatch({
+    print(p_risk_dist)
+  }, error = function(e) {
+    cat("Error creating risk distribution plot:", e$message, "\n")
+  })
+}
+
+# ========================================
+# FINAL RISK PREDICTION SUMMARY
+# ========================================
+print("=== FINAL RISK PREDICTION SUMMARY ===")
+
+# Performance summary
+cat("Model Performance Summary:\n")
+if(length(risk_performance) > 0) {
+  for(model_name in names(risk_performance)) {
+    cat(paste("\n", model_name, ":\n"))
+    cat(paste("  Training Accuracy:",
+             round(risk_performance[[model_name]]$train$accuracy, 3), "\n"))
+    cat(paste("  Testing Accuracy:",
+             round(risk_performance[[model_name]]$test$accuracy, 3), "\n"))
+    
+    if(!is.null(risk_performance[[model_name]]$test$auc)) {
+      cat(paste("  Testing AUC:",
+               round(risk_performance[[model_name]]$test$auc, 3), "\n"))
+    }
+  }
+}
+
+# Top risk factors
+if(exists("avg_importance")) {
+  cat("\nTop 5 Risk Factors:\n")
+  for(i in 1:min(5, nrow(avg_importance))) {
+    cat(paste(i, ".", avg_importance$Variable[i],
+             "(Importance:", round(avg_importance$Importance[i], 3), ")\n"))
+  }
+}
+
+# Risk category distribution
+if(exists("composite_risk_scores")) {
+  cat("\nRisk Category Distribution in Test Set:\n")
+  risk_table <- table(test_data$composite_risk_category)
+  for(i in 1:length(risk_table)) {
+    cat(paste(names(risk_table)[i], "Risk:", risk_table[i],
+             "(", round(100 * risk_table[i] / sum(risk_table), 1), "%)\n"))
+  }
+}
+
+cat("\n=== RISK FACTOR PREDICTION ANALYSIS COMPLETED ===\n")
+
+# ========================================
+# INDIVIDUAL RISK ASSESSMENT FUNCTIONS
+# ========================================
+print("=== CREATING INDIVIDUAL RISK ASSESSMENT FUNCTION ===")
+
+# Function to assess individual patient risk
+assess_individual_risk <- function(patient_data, models, predictors) {
+  cat("Individual Risk Assessment:\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  
+  # Ensure patient_data has all required predictors
+  missing_predictors <- setdiff(predictors, names(patient_data))
+  if(length(missing_predictors) > 0) {
+    cat("Warning: Missing predictors:", paste(missing_predictors, collapse = ", "), "\n")
+    return(NULL)
+  }
+  
+  # Calculate risk scores from each model
+  individual_scores <- list()
+  
+  # Random Forest
+  if("RF" %in% names(models) && !is.null(models$RF$model)) {
+    tryCatch({
+      rf_pred <- predict(models$RF$model, newdata = patient_data, type = "prob")
+      if(is.matrix(rf_pred) && ncol(rf_pred) >= 3 && "High" %in% colnames(rf_pred)) {
+        individual_scores$RF <- rf_pred[, "High"]
+        cat("Random Forest High Risk Probability:", round(individual_scores$RF, 3), "\n")
+      }
+    }, error = function(e) {
+      cat("Error in Random Forest prediction:", e$message, "\n")
+    })
+  }
+  
+  # SVM
+  if("SVM" %in% names(models) && !is.null(models$SVM$model)) {
+    tryCatch({
+      # Convert factors to numeric for SVM
+      patient_data_svm <- patient_data
+      factor_cols <- sapply(patient_data_svm, is.factor)
+      if(any(factor_cols)) {
+        patient_data_svm[factor_cols] <- lapply(patient_data_svm[factor_cols], as.numeric)
+      }
+      
+      svm_pred <- predict(models$SVM$model, newdata = patient_data_svm, probability = TRUE)
+      svm_prob <- attr(svm_pred, "probabilities")
+      if(!is.null(svm_prob) && "High" %in% colnames(svm_prob)) {
+        individual_scores$SVM <- svm_prob[, "High"]
+        cat("SVM High Risk Probability:", round(individual_scores$SVM, 3), "\n")
+      }
+    }, error = function(e) {
+      cat("Error in SVM prediction:", e$message, "\n")
+    })
+  }
+  
+  # Gradient Boosting
+  if("GBM" %in% names(models) && !is.null(models$GBM$model)) {
+    tryCatch({
+      gbm_pred <- predict(models$GBM$model, newdata = patient_data,
+                         n.trees = models$GBM$optimal_trees, type = "response")
+      if(is.array(gbm_pred) && dim(gbm_pred)[2] >= 3) {
+        individual_scores$GBM <- gbm_pred[, 3] # High risk class
+        cat("Gradient Boosting High Risk Probability:", round(individual_scores$GBM, 3), "\n")
+      }
+    }, error = function(e) {
+      cat("Error in GBM prediction:", e$message, "\n")
+    })
+  }
+  
+  # Logistic Regression (for binary high risk)
+  if("Logistic" %in% names(models) && !is.null(models$Logistic$model)) {
+    tryCatch({
+      logit_pred <- predict(models$Logistic$model, newdata = patient_data, type = "response")
+      individual_scores$Logistic <- logit_pred
+      cat("Logistic Regression High Risk Probability:", round(individual_scores$Logistic, 3), "\n")
+    }, error = function(e) {
+      cat("Error in Logistic Regression prediction:", e$message, "\n")
+    })
+  }
+  
+  # Calculate composite risk score
+  if(length(individual_scores) > 0) {
+    composite_score <- mean(unlist(individual_scores), na.rm = TRUE)
+    cat(paste(rep("-", 30), collapse = ""), "\n")
+    cat("Composite Risk Score:", round(composite_score, 3), "\n")
+    
+    # Risk interpretation
+    if(composite_score >= 0.67) {
+      risk_level <- "HIGH RISK"
+      color_code <- "🔴"
+    } else if(composite_score >= 0.33) {
+      risk_level <- "MODERATE RISK"
+      color_code <- "🟡"
+    } else {
+      risk_level <- "LOW RISK"
+      color_code <- "🟢"
+    }
+    
+    cat("Risk Level:", color_code, risk_level, "\n")
+    cat(paste(rep("=", 50), collapse = ""), "\n")
+    
+    return(list(
+      individual_scores = individual_scores,
+      composite_score = composite_score,
+      risk_level = risk_level
+    ))
+  } else {
+    cat("No valid predictions could be generated.\n")
+    return(NULL)
+  }
+}
+
+# Function to create sample patient
+create_sample_patient <- function(train_data, predictors) {
+  # Create a sample patient with median/mode values
+  sample_patient <- data.frame(matrix(nrow = 1, ncol = length(predictors)))
+  names(sample_patient) <- predictors
+  
+  for(predictor in predictors) {
+    if(predictor %in% names(train_data)) {
+      if(is.numeric(train_data[[predictor]])) {
+        sample_patient[[predictor]] <- median(train_data[[predictor]], na.rm = TRUE)
+      } else if(is.factor(train_data[[predictor]])) {
+        # Use the most frequent level
+        level_counts <- table(train_data[[predictor]])
+        sample_patient[[predictor]] <- as.factor(names(level_counts)[which.max(level_counts)])
+        levels(sample_patient[[predictor]]) <- levels(train_data[[predictor]])
+      } else {
+        # For character or other types, use mode
+        sample_patient[[predictor]] <- names(sort(table(train_data[[predictor]]), decreasing = TRUE))[1]
+      }
+    }
+  }
+  
+  return(sample_patient)
+}
+
+# Function for batch risk assessment
+batch_risk_assessment <- function(patient_data_batch, models, predictors) {
+  cat("Batch Risk Assessment for", nrow(patient_data_batch), "patients:\n")
+  cat(paste(rep("=", 60), collapse = ""), "\n")
+  
+  results <- data.frame(
+    Patient_ID = 1:nrow(patient_data_batch),
+    Composite_Risk_Score = numeric(nrow(patient_data_batch)),
+    Risk_Level = character(nrow(patient_data_batch)),
+    stringsAsFactors = FALSE
+  )
+  
+  for(i in 1:nrow(patient_data_batch)) {
+    patient <- patient_data_batch[i, , drop = FALSE]
+    
+    # Assess individual risk (suppress output for batch processing)
+    sink(nullfile()) # Suppress output
+    risk_result <- assess_individual_risk(patient, models, predictors)
+    sink() # Restore output
+    
+    if(!is.null(risk_result)) {
+      results$Composite_Risk_Score[i] <- risk_result$composite_score
+      results$Risk_Level[i] <- risk_result$risk_level
+    } else {
+      results$Composite_Risk_Score[i] <- NA
+      results$Risk_Level[i] <- "UNKNOWN"
+    }
+  }
+  
+  # Summary statistics
+  cat("Batch Assessment Summary:\n")
+  cat("High Risk Patients:", sum(results$Risk_Level == "HIGH RISK", na.rm = TRUE), "\n")
+  cat("Moderate Risk Patients:", sum(results$Risk_Level == "MODERATE RISK", na.rm = TRUE), "\n")
+  cat("Low Risk Patients:", sum(results$Risk_Level == "LOW RISK", na.rm = TRUE), "\n")
+  cat("Average Risk Score:", round(mean(results$Composite_Risk_Score, na.rm = TRUE), 3), "\n")
+  
+  return(results)
+}
+
+# Function to analyze risk factor contribution
+analyze_risk_factor_contribution <- function(patient_data, models, predictors) {
+  cat("Risk Factor Contribution Analysis:\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  
+  # Get baseline risk (using median/mode values)
+  if(exists("train_data")) {
+    baseline_patient <- create_sample_patient(train_data, predictors)
+    baseline_risk <- assess_individual_risk(baseline_patient, models, predictors)
+    
+    if(!is.null(baseline_risk)) {
+      baseline_score <- baseline_risk$composite_score
+      
+      # Calculate contribution of each factor
+      contributions <- data.frame(
+        Factor = character(),
+        Contribution = numeric(),
+        stringsAsFactors = FALSE
+      )
+      
+      for(predictor in predictors) {
+        if(predictor %in% names(patient_data)) {
+          # Create modified patient with baseline value for this predictor
+          modified_patient <- patient_data
+          modified_patient[[predictor]] <- baseline_patient[[predictor]]
+          
+          # Calculate risk with modified data
+          sink(nullfile())
+          modified_risk <- assess_individual_risk(modified_patient, models, predictors)
+          sink()
+          
+          if(!is.null(modified_risk)) {
+            contribution <- baseline_score - modified_risk$composite_score
+            contributions <- rbind(contributions,
+                                 data.frame(Factor = predictor,
+                                          Contribution = contribution))
+          }
+        }
+      }
+      
+      # Sort by absolute contribution
+      contributions <- contributions[order(-abs(contributions$Contribution)), ]
+      
+      cat("Top Risk Factor Contributions:\n")
+      print(head(contributions, 10))
+      
+      return(contributions)
+    }
+  }
+  
+  cat("Could not perform contribution analysis.\n")
+  return(NULL)
+}
+
+print("=== INDIVIDUAL RISK ASSESSMENT FUNCTIONS CREATED SUCCESSFULLY ===")
+
+cat("\n=== USAGE EXAMPLES ===\n")
+cat("1. For single patient assessment:\n")
+cat("   risk_result <- assess_individual_risk(patient_data, risk_models, predictors)\n\n")
+cat("2. For batch assessment:\n")
+cat("   batch_results <- batch_risk_assessment(multiple_patients, risk_models, predictors)\n\n")
+cat("3. For risk factor contribution analysis:\n")
+cat("   contributions <- analyze_risk_factor_contribution(patient_data, risk_models, predictors)\n\n")
+cat("4. To create sample patient data:\n")
+cat("   sample_patient <- create_sample_patient(train_data, predictors)\n\n
+print("=== ALL FUNCTIONS READY FOR USE ===")
+
+# ========================================
+# DEMONSTRATION OF INDIVIDUAL RISK ASSESSMENT
+# ========================================
+print("=== DEMONSTRATING INDIVIDUAL RISK ASSESSMENT ===")
+
+# Check if required objects exist before demonstration
+if(exists("risk_models") && exists("predictors") && exists("train_data")) {
+  if(length(risk_models) > 0) {
+    
+    # Create a sample patient for demonstration
+    tryCatch({
+      sample_patient <- create_sample_patient(train_data, predictors)
+      
+      cat("Sample Patient Data:\n")
+      print(sample_patient)
+      cat("\n")
+      
+      # Assess risk for sample patient
+      risk_assessment <- assess_individual_risk(sample_patient, risk_models, predictors)
+      
+      if(!is.null(risk_assessment)) {
+        cat("\nRisk Assessment Completed Successfully!\n")
+      }
+      
+    }, error = function(e) {
+      cat("Error in demonstration:", e$message, "\n")
+    })
+    
+  } else {
+    cat("No risk models available for demonstration.\n")
+  }
+} else {
+  cat("Required objects (risk_models, predictors, train_data) not found.\n")
+  cat("Please run the previous sections of the analysis first.\n")
+}
+
+print("=== SURVIVAL ANALYSIS AND RISK PREDICTION COMPLETE ===")
