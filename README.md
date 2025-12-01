@@ -8,10 +8,10 @@ It serves as a collection of experiments, research workflows, and analytical mod
 The collection includes several projects, from basic preprocessing tasks to advanced modeling workflows. 
 Across the repository, you will find:
 
-Data cleaning, wrangling, and transformation pipelines
-Exploratory Data Analysis (EDA) with visual
-Feature selection, extraction, and dimensionality reduction techniques
-Implementation and comparison of traditional and advanced ML algorithms
-Model evaluation using accuracy, precision, recall, F1-score, AUC, confusion matrices, and more
+Data cleaning, wrangling, and transformation pipelines.
+Exploratory Data Analysis (EDA) with visual.
+Feature selection, extraction, and dimensionality reduction techniques.
+Implementation and comparison of traditional and advanced ML algorithms.
+Model evaluation using accuracy, precision, recall, F1-score, AUC, confusion matrices, and more.
 
 EXPLORE!!
